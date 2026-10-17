@@ -1,0 +1,35 @@
+# Whitelist only. This working folder also holds Novation firmware, decompiler
+# output and analysis artifacts, none of which may be committed. Anything not
+# explicitly listed below is ignored.
+*
+!/patches/
+!/tools/
+
+!/.gitignore
+!/README.md
+!/LAST-KNOWN-GOOD.md
+!/requirements.txt
+
+!/patches/*.rs
+!/patches/*.ld
+!/patches/*.s
+!/patches/*.c
+
+!/tools/build_stereo_firmware.ps1
+!/tools/build_stereo_firmware.py
+!/tools/build_thumb_payload.ps1
+!/tools/build_dual_native_mono_dsp.py
+!/tools/extract_dsp_blocks.py
+!/tools/extract_firmware.py
+!/tools/pack_firmware.py
+!/tools/disassemble_thumb.py
+!/tools/validate_stereo_capture_transform.py
+!/tools/firmware_sender.html
+!/tools/firmware_sender_core.mjs
+!/tools/test_firmware_sender.html
+
+# Never, even if whitelisted above.
+*.syx
+*.bin
+*.lod
+*.dsp24

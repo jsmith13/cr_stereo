@@ -1,0 +1,103 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Firmware sender tests</title>
+<pre id="result">running</pre>
+<script type="module">
+  import {
+    parseFirmwareSysEx,
+    RequestDrivenSender,
+  } from "./firmware_sender_core.mjs";
+
+  function assert(condition, message) {
+    if (!condition) {
+      throw new Error(message);
+    }
+  }
+
+  function bootloaderMessage(command, payload) {
+    return Uint8Array.from([
+      0xf0, 0x00, 0x20, 0x29, 0x00, command, ...payload, 0xf7,
+    ]);
+  }
+
+  function blockRequest(index) {
+    return bootloaderMessage(0x72, [
+      index & 0x7f,
+      (index >>> 7) & 0x7f,
+      (index >>> 14) & 0x7f,
+    ]);
+  }
+
+  try {
+    const response = await fetch("../circuitrhythm-firmware-5706.syx");
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const firmware = parseFirmwareSysEx(bytes);
+    assert(firmware.version === 1841, "wrong version");
+    assert(firmware.declaredSize === 370032, "wrong size");
+    assert(firmware.declaredCrc === 0x9eee802c, "wrong CRC");
+    assert(firmware.writeMessages.length === 11563, "wrong write count");
+
+    const sent = [];
+    const sender = new RequestDrivenSender(
+      firmware,
+      (message) => sent.push(message),
+      { timeoutMs: 60000 },
+    );
+    sender.start();
+    assert(sent.length === 2, "INIT/HEADER were not sent");
+    for (let block = 1; block <= firmware.writeMessages.length; block += 1) {
+      assert(sender.handleMidi(blockRequest(block)), `request ${block} ignored`);
+    }
+    assert(sender.handleMidi(blockRequest(0)), "final block request ignored");
+    assert(
+      sent.length === firmware.writeMessages.length + 3,
+      "wrong transmitted message count",
+    );
+    assert(sent.at(-1) === firmware.finishMessage, "FINISH was not sent last");
+    assert(
+      sender.handleMidi(bootloaderMessage(0x73, [0x7f, 0x7f, 0x7f])),
+      "success response ignored",
+    );
+    assert(sender.state === "succeeded", "sender did not succeed");
+
+    const retrySent = [];
+    const retryEvents = [];
+    const retrySender = new RequestDrivenSender(
+      firmware,
+      (message) => retrySent.push(message),
+      {
+        timeoutMs: 60000,
+        onProgress: (event) => retryEvents.push(event),
+      },
+    );
+    retrySender.start();
+    retrySender.handleMidi(blockRequest(1));
+    retrySender.handleMidi(blockRequest(1));
+    assert(retrySent.length === 4, "duplicate request was not resent");
+    assert(retryEvents.at(-1).duplicate, "duplicate retry was not reported");
+    retrySender.cancel();
+
+    const badOrderSender = new RequestDrivenSender(
+      firmware,
+      () => {},
+      { timeoutMs: 60000 },
+    );
+    badOrderSender.start();
+    badOrderSender.handleMidi(blockRequest(2));
+    assert(badOrderSender.state === "failed", "out-of-order request was accepted");
+
+    const corrupted = bytes.slice();
+    corrupted[100] ^= 1;
+    let rejected = false;
+    try {
+      parseFirmwareSysEx(corrupted);
+    } catch (error) {
+      rejected = /CRC mismatch/.test(error.message);
+    }
+    assert(rejected, "corrupted firmware was not rejected by CRC");
+
+    document.querySelector("#result").textContent = "firmware sender tests passed";
+  } catch (error) {
+    document.querySelector("#result").textContent = `FAILED: ${error.stack}`;
+  }
+</script>

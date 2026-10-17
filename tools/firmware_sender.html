@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Circuit Rhythm Request-Driven Firmware Sender</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: system-ui, sans-serif;
+      }
+      body {
+        max-width: 52rem;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        background: #161616;
+        color: #eee;
+      }
+      fieldset {
+        margin: 1rem 0;
+        padding: 1rem;
+        border: 1px solid #555;
+      }
+      label {
+        display: block;
+        margin: 0.7rem 0;
+      }
+      select, input, button {
+        margin-left: 0.5rem;
+      }
+      button {
+        padding: 0.55rem 0.9rem;
+      }
+      #send {
+        background: #a32f2f;
+        color: white;
+        border: 1px solid #d66;
+      }
+      #status {
+        font-weight: 700;
+      }
+      #log {
+        min-height: 10rem;
+        max-height: 22rem;
+        overflow: auto;
+        padding: 0.8rem;
+        background: #080808;
+        white-space: pre-wrap;
+      }
+      progress {
+        width: 100%;
+      }
+      .warning {
+        color: #ffcc66;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Circuit Rhythm firmware sender</h1>
+    <p class="warning">
+      This writes firmware. Use only with the Circuit Rhythm bootloader and a
+      validated image. Keep USB and power connected until success is reported.
+    </p>
+
+    <fieldset>
+      <legend>1. Validated firmware</legend>
+      <label>
+        SysEx file
+        <input id="firmware-file" type="file" accept=".syx">
+      </label>
+      <pre id="firmware-details">No firmware loaded.</pre>
+    </fieldset>
+
+    <fieldset>
+      <legend>2. Bootloader MIDI ports</legend>
+      <button id="connect" type="button">Connect MIDI</button>
+      <label>
+        Input
+        <select id="input-port"></select>
+      </label>
+      <label>
+        Output
+        <select id="output-port"></select>
+      </label>
+    </fieldset>
+
+    <fieldset>
+      <legend>3. Transmission</legend>
+      <button id="send" type="button" disabled>Send validated firmware</button>
+      <button id="cancel" type="button" disabled>Stop waiting</button>
+      <p id="status">Idle</p>
+      <progress id="progress" value="0" max="1"></progress>
+      <pre id="log"></pre>
+    </fieldset>
+
+    <script type="module">
+      import {
+        parseFirmwareSysEx,
+        RequestDrivenSender,
+      } from "./firmware_sender_core.mjs";
+
+      const elements = {
+        file: document.querySelector("#firmware-file"),
+        details: document.querySelector("#firmware-details"),
+        connect: document.querySelector("#connect"),
+        input: document.querySelector("#input-port"),
+        output: document.querySelector("#output-port"),
+        send: document.querySelector("#send"),
+        cancel: document.querySelector("#cancel"),
+        status: document.querySelector("#status"),
+        progress: document.querySelector("#progress"),
+        log: document.querySelector("#log"),
+      };
+
+      let midiAccess = null;
+      let firmware = null;
+      let firmwareName = null;
+      let firmwareSha256 = null;
+      let firmwareIdentity = null;
+      let sender = null;
+      let attachedInput = null;
+
+      const knownFirmware = new Map([
+        [
+          "D5B9FF5DADF2E284F80D69ECB7087486CF0DF315A697BED8272AF9DE0E90DF15",
+          "Official Circuit Rhythm build 5706",
+        ],
+      ]);
+
+      function log(message) {
+        const timestamp = new Date().toLocaleTimeString();
+        elements.log.textContent += `[${timestamp}] ${message}\n`;
+        elements.log.scrollTop = elements.log.scrollHeight;
+      }
+
+      function hex(value, width = 8) {
+        return value.toString(16).toUpperCase().padStart(width, "0");
+      }
+
+      function selectedPort(select, ports) {
+        return [...ports.values()].find((port) => port.id === select.value) ?? null;
+      }
+
+      function isBootloaderPort(port) {
+        return port !== null && /Circuit Rhythm Boot/i.test(port.name ?? "");
+      }
+
+      function refreshReadyState() {
+        const input = midiAccess
+          ? selectedPort(elements.input, midiAccess.inputs)
+          : null;
+        const output = midiAccess
+          ? selectedPort(elements.output, midiAccess.outputs)
+          : null;
+        elements.send.disabled =
+          firmware === null ||
+          !isBootloaderPort(input) ||
+          !isBootloaderPort(output) ||
+          sender !== null;
+      }
+
+      function populatePortSelect(select, ports) {
+        const prior = select.value;
+        select.replaceChildren();
+        for (const port of ports.values()) {
+          const option = document.createElement("option");
+          option.value = port.id;
+          option.textContent = `${port.name} (${port.state})`;
+          select.append(option);
+        }
+        const bootOption = [...select.options].find((option) =>
+          /Circuit Rhythm Boot/i.test(option.textContent),
+        );
+        select.value =
+          [...select.options].some((option) => option.value === prior)
+            ? prior
+            : bootOption?.value ?? select.options[0]?.value ?? "";
+      }
+
+      function refreshPorts() {
+        if (midiAccess === null) {
+          return;
+        }
+        populatePortSelect(elements.input, midiAccess.inputs);
+        populatePortSelect(elements.output, midiAccess.outputs);
+        attachInput();
+        refreshReadyState();
+      }
+
+      function attachInput() {
+        const input = selectedPort(elements.input, midiAccess.inputs);
+        if (attachedInput === input) {
+          return;
+        }
+        if (attachedInput !== null) {
+          attachedInput.removeEventListener("midimessage", handleMidi);
+        }
+        attachedInput = input;
+        attachedInput?.addEventListener("midimessage", handleMidi);
+      }
+
+      function handleMidi(event) {
+        sender?.handleMidi(event.data);
+      }
+
+      elements.file.addEventListener("change", async () => {
+        firmware = null;
+        firmwareName = null;
+        firmwareSha256 = null;
+        firmwareIdentity = null;
+        elements.details.textContent = "Validating...";
+        refreshReadyState();
+
+        const file = elements.file.files[0];
+        if (!file) {
+          elements.details.textContent = "No firmware loaded.";
+          return;
+        }
+
+        try {
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          const parsed = parseFirmwareSysEx(bytes);
+          const digest = await crypto.subtle.digest("SHA-256", parsed.firmware);
+          firmware = parsed;
+          firmwareName = file.name;
+          firmwareSha256 = Array.from(new Uint8Array(digest), (value) =>
+            value.toString(16).padStart(2, "0"),
+          ).join("").toUpperCase();
+          firmwareIdentity = knownFirmware.get(firmwareSha256) ?? null;
+          elements.details.textContent = [
+            `File: ${firmwareName}`,
+            `Identity: ${firmwareIdentity ?? "UNKNOWN OR CUSTOM IMAGE"}`,
+            `Embedded version: ${parsed.version} (0x${hex(parsed.version, 0)})`,
+            `Decoded size: ${parsed.declaredSize} bytes (0x${hex(parsed.declaredSize, 0)})`,
+            `CRC-32/MPEG-2: ${hex(parsed.declaredCrc)}`,
+            `SHA-256: ${firmwareSha256}`,
+            `Requested write blocks: ${parsed.writeMessages.length}`,
+          ].join("\n");
+          log(`Validated ${firmwareName}`);
+        } catch (error) {
+          elements.details.textContent = `Rejected: ${error.message}`;
+          log(`Firmware rejected: ${error.message}`);
+        }
+        refreshReadyState();
+      });
+
+      elements.connect.addEventListener("click", async () => {
+        try {
+          if (midiAccess === null) {
+            midiAccess = await navigator.requestMIDIAccess({ sysex: true });
+            midiAccess.addEventListener("statechange", refreshPorts);
+          }
+          refreshPorts();
+          log("MIDI access granted");
+        } catch (error) {
+          log(`MIDI access failed: ${error.message}`);
+        }
+      });
+
+      elements.input.addEventListener("change", () => {
+        attachInput();
+        refreshReadyState();
+      });
+      elements.output.addEventListener("change", refreshReadyState);
+
+      elements.send.addEventListener("click", () => {
+        const input = selectedPort(elements.input, midiAccess.inputs);
+        const output = selectedPort(elements.output, midiAccess.outputs);
+        if (!isBootloaderPort(input) || !isBootloaderPort(output)) {
+          log("Refused: select Circuit Rhythm Boot input and output ports");
+          return;
+        }
+
+        const requiredConfirmation =
+          firmwareIdentity === null ? "SEND CUSTOM" : "SEND STOCK";
+        const confirmation = prompt(
+          [
+            "This will write firmware to the Circuit Rhythm.",
+            "",
+            firmwareName,
+            `Identity: ${firmwareIdentity ?? "UNKNOWN OR CUSTOM IMAGE"}`,
+            `Size: ${firmware.declaredSize} bytes`,
+            `CRC: ${hex(firmware.declaredCrc)}`,
+            `SHA-256: ${firmwareSha256}`,
+            "",
+            `Type ${requiredConfirmation} to continue.`,
+          ].join("\n"),
+        );
+        if (confirmation !== requiredConfirmation) {
+          log("Transmission cancelled at confirmation");
+          return;
+        }
+
+        elements.progress.max = firmware.writeMessages.length;
+        elements.progress.value = 0;
+        elements.send.disabled = true;
+        elements.cancel.disabled = false;
+
+        sender = new RequestDrivenSender(
+          firmware,
+          (message) => output.send(message),
+          {
+            timeoutMs: 10000,
+            onProgress: ({ sentBlocks, totalBlocks, duplicate }) => {
+              elements.progress.value = sentBlocks;
+              elements.status.textContent = `Writing block ${sentBlocks}/${totalBlocks}`;
+              if (duplicate) {
+                log(`Bootloader requested retry of block ${sentBlocks}`);
+              }
+            },
+            onStateChange: (state, error) => {
+              if (state === "waiting-for-request") {
+                elements.status.textContent = "Waiting for bootloader block requests...";
+              } else if (state === "waiting-for-finish") {
+                elements.status.textContent = "Waiting for final bootloader status...";
+              } else if (state === "succeeded") {
+                elements.status.textContent =
+                  "SUCCESS: bootloader accepted the firmware. Wait for normal restart.";
+                elements.cancel.disabled = true;
+                log("Bootloader returned the 7F 7F 7F success status");
+                sender = null;
+                refreshReadyState();
+              } else if (state === "failed") {
+                elements.status.textContent = `FAILED: ${error}`;
+                elements.cancel.disabled = true;
+                log(`Transmission failed: ${error}`);
+                sender = null;
+                refreshReadyState();
+              } else if (state === "cancelled") {
+                elements.status.textContent =
+                  "Stopped waiting. Do not power-cycle during an active flash operation.";
+                elements.cancel.disabled = true;
+                log("Sender stopped");
+                sender = null;
+                refreshReadyState();
+              }
+            },
+          },
+        );
+
+        log(`Starting request-driven transmission to ${output.name}`);
+        sender.start();
+      });
+
+      elements.cancel.addEventListener("click", () => sender?.cancel());
+
+      window.addEventListener("beforeunload", (event) => {
+        if (sender !== null) {
+          event.preventDefault();
+          event.returnValue = "";
+        }
+      });
+    </script>
+  </body>
+</html>

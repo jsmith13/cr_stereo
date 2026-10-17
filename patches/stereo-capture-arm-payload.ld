@@ -1,0 +1,90 @@
+ENTRY(stereo_start_request)
+
+SECTIONS
+{
+    . = 0x0806A570;
+
+    .text :
+    {
+        KEEP(*(.text.stereo_start_request))
+        KEEP(*(.text.native_dsp_upload_primary_b))
+        KEEP(*(.text.writer_request_probe_entry))
+        KEEP(*(.text.stock_start_request_trampoline))
+        KEEP(*(.text.stereo_pump))
+        KEEP(*(.text.stock_pump_trampoline))
+        KEEP(*(.text.stereo_file_callback))
+        KEEP(*(.text.stock_file_callback_trampoline))
+        KEEP(*(.text.capture_transform_in_place))
+        KEEP(*(.text.diagnostic_fatfs_write))
+        KEEP(*(.text.stereo_prepare_destination))
+        KEEP(*(.text.stock_prepare_destination_trampoline))
+        KEEP(*(.text.sample_pair_render))
+        KEEP(*(.text.sample_pair_view_init_epilogue))
+        KEEP(*(.text.sample_pair_press))
+        KEEP(*(.text.sample_pair_clear_canonical_pad))
+        KEEP(*(.text.sample_pair_release))
+        KEEP(*(.text.sample_pair_page_event))
+        KEEP(*(.text.sample_pair_wav_validate))
+        KEEP(*(.text.sample_pair_pack_load))
+        KEEP(*(.text.sample_pair_direct_pack_load))
+        KEEP(*(.text.sample_pair_clear_request))
+        KEEP(*(.text.sample_pair_clear_entry))
+        KEEP(*(.text.crop_io_trace_entry))
+        KEEP(*(.text.crop_knob_router))
+        KEEP(*(.text.crop_window_set))
+        KEEP(*(.text.crop_window_set_wait))
+        KEEP(*(.text.sample_pair_clear_canonical_slot))
+        KEEP(*(.text.sample_pair_clear_callback))
+        KEEP(*(.text.sample_pair_clear_sync_callback))
+        KEEP(*(.text.sample_pair_save_publish))
+        KEEP(*(.text.sample_pair_occupancy_notify))
+        KEEP(*(.text.stereo_main_loop_tick))
+        KEEP(*(.text.stereo_save_request))
+        KEEP(*(.text.native_stock_capture_source_read))
+        KEEP(*(.text.native_stock_capture_chunk_read))
+        KEEP(*(.text.stereo_stock_header_write))
+        KEEP(*(.text.sample_pair_writer_coupling_marker))
+        KEEP(*(.text.sample_cache_refresh_marker))
+        KEEP(*(.text.paired_playback_marker))
+        KEEP(*(.text.stereo_position_marker))
+        KEEP(*(.text.writer_state_prepare_allocation))
+        KEEP(*(.text.paired_playback_note_on))
+        KEEP(*(.text.paired_playback_note_off))
+        KEEP(*(.text.stereo_position_observable_set))
+        KEEP(*(.text.stereo_position_dsp_update))
+        KEEP(*(.text.stereo_position_grid_render))
+        KEEP(*(.text.stereo_position_mixer_press))
+        KEEP(*(.text.stereo_position_mixer_knob))
+        KEEP(*(.text.mixer_volume_vtable_probe))
+        KEEP(*(.text.mixer_volume_branch_probe))
+        KEEP(*(.text.fx_send_mixer_knob))
+        KEEP(*(.text.fx_send_pair_render))
+        KEEP(*(.text.sidechain_pair_press))
+        KEEP(*(.text.sidechain_pair_render))
+        KEEP(*(.text.track_pair_button_press))
+        KEEP(*(.text.track_pair_button_release))
+        KEEP(*(.text.sample_bank_compose))
+        KEEP(*(.text.pair_color_boot_main))
+        KEEP(*(.text.pair_color_main_task))
+        KEEP(*(.text.pair_track_buttons_notify))
+        KEEP(*(.text.pair_track_buttons_notify_thunk))
+        KEEP(*(.text.fx_send_outer_probe))
+        KEEP(*(.text.fx_send_render_probe))
+        KEEP(*(.text.root_knob_probe))
+        KEEP(*(.text.writer_state_constructor))
+        *(.text*)
+        *(.rodata*)
+    }
+
+    .ARM.exidx :
+    {
+        *(.ARM.exidx*)
+    }
+
+    /DISCARD/ :
+    {
+        *(.comment)
+        *(.note*)
+        *(.ARM.attributes)
+    }
+}
