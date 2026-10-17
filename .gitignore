@@ -6,6 +6,7 @@
 !/tools/
 
 !/.gitignore
+!/LICENSE
 !/README.md
 !/LAST-KNOWN-GOOD.md
 !/requirements.txt

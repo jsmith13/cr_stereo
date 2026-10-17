@@ -122,3 +122,10 @@ Novation Components.
 The patch tables refer to stock code only by address. Each patch first checks
 the stock bytes it will change: short ones are compared literally, and longer
 instruction sequences are checked by length and SHA-256.
+
+## License
+
+The contents of this repository are released under the MIT License (see
+`LICENSE`). The license does not cover Novation's firmware, which you obtain
+separately under Novation's own terms. Patched images built from it should not
+be redistributed.
