@@ -81,6 +81,8 @@ param(
     [switch]$CropExtentProbe,
     [switch]$CropIoTrace,
     [switch]$CropMirrorWindow,
+    [switch]$KeygroupPoc,
+    [switch]$KeygroupSeed,
 
     [switch]$NativeWriterReadinessProbeDiagnostic,
 
@@ -272,6 +274,15 @@ if ($CropExtentProbe) {
 }
 if ($CropIoTrace) {
     $rustcArguments += @('--cfg', 'crop_io_trace')
+}
+if ($KeygroupPoc) {
+    $rustcArguments += @('--cfg', 'keygroup_poc')
+}
+if ($KeygroupSeed) {
+    if (-not $KeygroupPoc) {
+        throw 'KeygroupSeed requires KeygroupPoc'
+    }
+    $rustcArguments += @('--cfg', 'keygroup_seed')
 }
 if ($CropMirrorWindow) {
     $rustcArguments += @('--cfg', 'crop_mirror_window')

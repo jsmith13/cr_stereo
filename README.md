@@ -11,7 +11,9 @@ locally. Never commit firmware images (`*.syx`, `*.bin`) or build output.
 Unofficial and unsupported by Novation. Flashing custom firmware is at your own
 risk. The official firmware can always be reinstalled through the bootloader.
 
-## Features (v0.1.0)
+## Features (v0.2.0)
+
+### Stereo (since v0.1.0)
 
 - **Stereo sampling:** a stereo recording is captured as two mono samples, left in
   slot *N* and right in slot *N+1*, which are remembered as a stereo pair.
@@ -30,6 +32,40 @@ risk. The official firmware can always be reinstalled through the bootloader.
 
 Stereo halves on an unpaired track play as ordinary mono samples.
 `LAST-KNOWN-GOOD.md` has hardware-confirmed details of every feature.
+
+### Key groups and auto-sampling (new in v0.2.0)
+
+Built with `-KeygroupPoc` (part of the release command below).
+
+- **Key groups:** a run of samples tagged with root notes plays as one
+  multi-sample instrument. A track holding a member of a set plays the whole
+  set across the keys, each note using the member with the nearest root.
+  Tags are stored in each WAV header, so sets survive a power cycle. Sample
+  Mode pad 2 switches key-group playback off for a track (saved with the
+  project).
+- **Auto-sampler** (Sample Rec page, row 3) records a key group from an
+  external synth on MIDI channel 1. Select an empty slot, then press pad 8 of
+  row 3. It plays C2 to C6, one note per slot upward, records each note with
+  its tail, trims the silence and saves it. Arm a stereo pair first to sample
+  in stereo (pairs then need an even start slot). Press pad 8 again to abort.
+  - Hold row-3 pad 6 and press a row-4 pad to set the note spacing: 1, 2, 3,
+    4, 6, 8, 12 or 24 semitones (default 3).
+  - Press row-3 pad 7 to switch the note hold between 1 s (dim) and 4 s
+    (bright).
+  - Pad 8 glows green when a run finishes. On failure it glows red, and a
+    row-4 pad shows the reason. Red pads 1 to 8: no pack, not ready, odd
+    start slot for a pair, run past the last slot, slots in use, arm timeout,
+    not armed, no sound. Amber pads 1 to 4: slot deselected, take cut short,
+    save timeout, not enough free sample memory.
+- **Auto-captured series** show in tan (mono) or sky blue (stereo) on the
+  Sample Rec page and the Sample page bank. Selecting any member lights the
+  whole series bright (on the Sample page, only while key groups are on for
+  the track). Clearing any member clears the whole series, one slot after
+  another.
+- **Sample memory guard:** Record is refused when less than about a second
+  of sample memory per channel remains, and a take stops by itself just
+  before memory runs out, so it is saved intact. Either case flashes rows 3
+  and 4 red.
 
 ## Requirements (Windows)
 
@@ -71,7 +107,8 @@ The build only accepts official build 5706:
 pwsh tools\build_stereo_firmware.ps1 -OutputDirectory build\release `
   -NativeDualCapturePoc -SafePairGuard -SamplePairLedPoc -SamplePairIdentityPoc `
   -SamplePairGesturePoc -SamplePairWriterCouplingPoc -SampleCacheRefreshPoc `
-  -PairedPlaybackPoc -StereoPositionPoc -StereoStockSaveQueue -CropMirrorWindow
+  -PairedPlaybackPoc -StereoPositionPoc -StereoStockSaveQueue -CropMirrorWindow `
+  -KeygroupPoc
 ```
 
 The output in `build\release` is:
@@ -80,12 +117,15 @@ The output in `build\release` is:
 - A `.bin` image.
 - A `.json` manifest that lists every patched byte range.
 
-v0.1.0 should reproduce this image exactly:
+v0.2.0 should reproduce this image exactly:
 
 | File | SHA-256 |
 |---|---|
-| `.bin` | `E5463E328811C577D5AFA94DBB5B26B88381A386281FD81B4C7BEF17A4E925B6` |
-| `.syx` | `23AA62E3E547046C5107E96DED8596F2A0186AA131E47D3DF6A2225BF1579FA5` |
+| `.bin` | `8F0A427E17A7F274E8E07ED1BA1F78C5A367BC99CC03D2D97557A51542B53217` |
+| `.syx` | `EBC7491185988B09EE1F450F391BBE5CAD7B05605DE9AB7F4D3833151717BDA0` |
+
+The v0.1.0 tag, built without `-KeygroupPoc`, gives `.bin`
+`E5463E328811C577D5AFA94DBB5B26B88381A386281FD81B4C7BEF17A4E925B6`.
 
 The other switches in the build script are diagnostics and probes kept from
 development. They are not part of the release configuration.

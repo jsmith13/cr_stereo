@@ -72,6 +72,10 @@ SECTIONS
         KEEP(*(.text.fx_send_render_probe))
         KEEP(*(.text.root_knob_probe))
         KEEP(*(.text.writer_state_constructor))
+        KEEP(*(.text.keygroup_marker))
+        KEEP(*(.text.keygroup_bank_press))
+        KEEP(*(.text.keygroup_group_press))
+        KEEP(*(.text.sample_rec_record_press))
         *(.text*)
         *(.rodata*)
     }

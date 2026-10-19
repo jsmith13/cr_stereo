@@ -1199,6 +1199,2119 @@ unsafe fn paired_follower_track(track: u32) -> bool {
         && paired_pair_enabled(track - 1)
 }
 
+#[cfg(all(
+    keygroup_poc,
+    not(all(
+        paired_playback_poc,
+        stereo_position_poc,
+        sample_pair_identity_poc,
+        stereo_stock_save_queue,
+        sample_pair_gesture_poc,
+        sample_pair_writer_coupling_poc,
+        native_dual_capture_poc
+    ))
+))]
+compile_error!(
+    "keygroup_poc requires paired_playback_poc, stereo_position_poc, \
+     sample_pair_identity_poc, stereo_stock_save_queue, sample_pair_gesture_poc, \
+     sample_pair_writer_coupling_poc and native_dual_capture_poc"
+);
+
+#[cfg(keygroup_poc)]
+#[no_mangle]
+pub extern "C" fn keygroup_marker() {}
+
+/// Key groups are automatic: a sample carrying a root tag belongs to a
+/// multi-sample set, and a track whose sample is in a set plays the whole set
+/// across the keys. Each note plays the member with the nearest root (ties go
+/// to the higher root), pitched relative to that root. Roots and keys are
+/// MIDI note numbers (Note view keys transmit their internal note unchanged);
+/// the voice engine plays a sample at its recorded pitch at note
+/// `KG_UNITY_NOTE` (60: with key groups off, Note view key C4 matches the
+/// Sample Rec preview of the same sample).
+///
+/// A set is a run of tagged slots that begins at a slot with the set-start
+/// flag and continues upward to the next untagged slot or the next start.
+/// Right halves of stereo pairs are skipped (a pair is one member).
+///
+/// Tags live in each WAV header's byte-rate field, which stock never
+/// validates: `96000 + 4 * tag + role`, role 0 none / 1 stereo left / 2 stereo
+/// right (so the plain 96001/96002 pair markers are tag 0), tag 0 none, else
+/// `1 + root + 128 * set_start`. The pack-load scan rebuilds a RAM table from
+/// them; saves restamp them and Clear forgets them.
+///
+/// The only per-project state is a per-track "off" mask, toggled by Sample
+/// Mode pad 2, in the project image's spare tail (`image + 0x29110`, 0x374
+/// bytes, reserved by the blank-project constructor and otherwise untouched by
+/// stock), so it is saved and loaded with the project. Layout: magic, version
+/// (2), disabled mask (bit per track). Version 1 records (explicit zones, test
+/// builds only) are ignored.
+#[cfg(keygroup_poc)]
+const KG_TAIL_OFFSET: usize = 0x29110;
+#[cfg(keygroup_poc)]
+const KG_IMAGE_SIZE: u32 = 0x29484;
+#[cfg(keygroup_poc)]
+const KG_RECORD_MAGIC: u32 = 0x3152_474b;
+#[cfg(keygroup_poc)]
+const KG_RECORD_VERSION: u8 = 2;
+#[cfg(keygroup_poc)]
+const KG_RECORD_VERSION_OFFSET: usize = 4;
+#[cfg(keygroup_poc)]
+const KG_RECORD_DISABLED_OFFSET: usize = 5;
+
+/// Root table for the loaded pack, after `KG_STATE` in the same private RAM
+/// gap (below the 0x2004FE00 main-stack bound). Rebuilt by every pack-load
+/// scan, so it is independent of `keygroup_init`. Layout: magic, pack (0xFF
+/// while scanning or after a failed load), seeded flag, then one byte per
+/// slot: 0xFF untagged, else bit 7 set start and bits 0-6 root (`tag - 1`).
+#[cfg(keygroup_poc)]
+const KG_ROOTS: *mut u8 = 0x2004_fc70 as *mut u8;
+#[cfg(keygroup_poc)]
+const KG_ROOTS_MAGIC: u32 = 0x5452_474b;
+#[cfg(keygroup_poc)]
+const KG_ROOTS_PACK: usize = 4;
+#[cfg(keygroup_poc)]
+const KG_ROOTS_SEEDED: usize = 5;
+#[cfg(keygroup_poc)]
+const KG_ROOTS_TABLE: usize = 8;
+#[cfg(keygroup_poc)]
+const KG_ROOT_NONE: u8 = 0xff;
+#[cfg(keygroup_poc)]
+const KG_ROOT_SET_START: u8 = 0x80;
+#[cfg(keygroup_poc)]
+const KG_BYTE_RATE_BASE: u32 = 96_000;
+#[cfg(keygroup_poc)]
+const KG_BYTE_RATE_TAGS: u32 = 257;
+
+/// Runtime state in the payload's private RAM gap after
+/// `OCCUPANCY_MODEL_CACHE`, initialised at Main-task entry; nothing reads or
+/// writes it before the magic is set.
+#[cfg(keygroup_poc)]
+const KG_STATE: *mut u8 = 0x2004_fc48 as *mut u8;
+#[cfg(keygroup_poc)]
+const KG_STATE_MAGIC: u32 = 0x4b47_5354;
+/// Project image, validated by the main loop each tick (0 if unavailable).
+#[cfg(keygroup_poc)]
+const KG_IMAGE: usize = 4;
+/// Session object: 0 not searched, 1 not found, else its address.
+#[cfg(keygroup_poc)]
+const KG_SESSION: usize = 8;
+/// Track index + 1 whose sample bank is being pressed (its preview note
+/// bypasses key groups), else 0.
+#[cfg(keygroup_poc)]
+const KG_BYPASS: usize = 12;
+/// Main-loop ticks until the next session search after a miss.
+#[cfg(keygroup_poc)]
+const KG_RETRY: usize = 13;
+/// Per voice: the zone slot it was given (0xFF none). The note-on flush of a
+/// newly selected sample is redirected to this slot.
+#[cfg(keygroup_poc)]
+const KG_VOICE_SLOT: usize = 16;
+/// Per track: the last remapped note-on, as (incoming, played); 0xFF none.
+#[cfg(keygroup_poc)]
+const KG_HELD_NOTE: usize = 24;
+#[cfg(keygroup_poc)]
+const KG_PLAYED_NOTE: usize = 32;
+#[cfg(keygroup_poc)]
+const KG_STATE_BYTES: usize = 40;
+/// Never matches a played note (remaps are clamped to 0..=110), so stock
+/// ignores a note-off carrying it.
+#[cfg(keygroup_poc)]
+const KG_NO_NOTE: u32 = 127;
+
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_init() {
+    let mut offset = 4;
+    while offset < KG_STATE_BYTES {
+        let value = if offset >= KG_VOICE_SLOT { 0xff } else { 0 };
+        write_volatile(KG_STATE.add(offset), value);
+        offset += 1;
+    }
+    write_volatile(KG_STATE.cast::<u32>(), KG_STATE_MAGIC);
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_ready() -> bool {
+    read_volatile(KG_STATE.cast::<u32>()) == KG_STATE_MAGIC
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_state_u8(offset: usize) -> u8 {
+    read_volatile(KG_STATE.add(offset))
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_set_state_u8(offset: usize, value: u8) {
+    write_volatile(KG_STATE.add(offset), value);
+}
+
+/// The project image, or null.
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_image() -> *mut u8 {
+    if !keygroup_ready() {
+        return core::ptr::null_mut();
+    }
+    let image = read_volatile(KG_STATE.add(KG_IMAGE).cast::<u32>()) as *mut u8;
+    if image.is_null() || read_u32(image, 4) != KG_IMAGE_SIZE {
+        return core::ptr::null_mut();
+    }
+    image
+}
+
+/// The project record, or null when the project has none.
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_record() -> *mut u8 {
+    let image = keygroup_image();
+    if image.is_null() {
+        return image;
+    }
+    let record = image.add(KG_TAIL_OFFSET);
+    if read_u32(record, 0) != KG_RECORD_MAGIC
+        || read_u8(record, KG_RECORD_VERSION_OFFSET) != KG_RECORD_VERSION
+    {
+        return core::ptr::null_mut();
+    }
+    record
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_track_disabled(index: u32) -> bool {
+    let record = keygroup_record();
+    !record.is_null() && read_u8(record, KG_RECORD_DISABLED_OFFSET) >> index & 1 != 0
+}
+
+/// Flips a track's off bit, creating the record if the project has none. The
+/// project is not marked dirty; the change persists once the project is saved.
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_toggle_track(index: u32) {
+    let mut record = keygroup_record();
+    if record.is_null() {
+        let image = keygroup_image();
+        if image.is_null() {
+            return;
+        }
+        record = image.add(KG_TAIL_OFFSET);
+        write_u8(record, KG_RECORD_VERSION_OFFSET, KG_RECORD_VERSION);
+        write_u8(record, KG_RECORD_DISABLED_OFFSET, 0);
+        write_u8(record, 6, 0);
+        write_u8(record, 7, 0);
+        write_u32(record, 0, KG_RECORD_MAGIC);
+    }
+    write_u8(
+        record,
+        KG_RECORD_DISABLED_OFFSET,
+        read_u8(record, KG_RECORD_DISABLED_OFFSET) ^ (1 << index),
+    );
+}
+
+/// Pack-load scan start: forget every tag until the scan reports them.
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_roots_begin_scan() {
+    write_volatile(KG_ROOTS.add(KG_ROOTS_PACK), 0xff);
+    write_volatile(KG_ROOTS.add(KG_ROOTS_SEEDED), 0);
+    let mut slot = 0;
+    while slot < 128 {
+        write_volatile(KG_ROOTS.add(KG_ROOTS_TABLE + slot), KG_ROOT_NONE);
+        slot += 1;
+    }
+    write_volatile(KG_ROOTS.cast::<u32>(), KG_ROOTS_MAGIC);
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_roots_end_scan(pack: u8) {
+    if read_volatile(KG_ROOTS.cast::<u32>()) == KG_ROOTS_MAGIC {
+        write_volatile(KG_ROOTS.add(KG_ROOTS_PACK), pack);
+    }
+}
+
+/// Splits a WAV byte rate into (stereo role, tag); anything outside the
+/// encoding is (0, 0).
+#[cfg(keygroup_poc)]
+fn keygroup_decode_byte_rate(byte_rate: u32) -> (u32, u32) {
+    let delta = byte_rate.wrapping_sub(KG_BYTE_RATE_BASE);
+    if delta < 4 * KG_BYTE_RATE_TAGS && delta & 3 != 3 {
+        (delta & 3, delta >> 2)
+    } else {
+        (0, 0)
+    }
+}
+
+/// Scan: records a slot's tag (tag 256, root 127 starting a set, collides with
+/// "untagged" and is treated as such).
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_roots_note(slot: u8, tag: u32) {
+    if slot < 128 && read_volatile(KG_ROOTS.cast::<u32>()) == KG_ROOTS_MAGIC {
+        let value = if tag == 0 { KG_ROOT_NONE } else { (tag - 1) as u8 };
+        write_volatile(KG_ROOTS.add(KG_ROOTS_TABLE + slot as usize), value);
+    }
+}
+
+/// The pack the root table describes, or 0xFF.
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_roots_pack() -> u8 {
+    if read_volatile(KG_ROOTS.cast::<u32>()) != KG_ROOTS_MAGIC {
+        return 0xff;
+    }
+    let pack = read_volatile(KG_ROOTS.add(KG_ROOTS_PACK));
+    if pack < 0x20 { pack } else { 0xff }
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_root_byte(slot: u8) -> u8 {
+    if slot >= 128 || keygroup_roots_pack() == 0xff {
+        return KG_ROOT_NONE;
+    }
+    read_volatile(KG_ROOTS.add(KG_ROOTS_TABLE + slot as usize))
+}
+
+/// The header tag a save of `slot` into `pack` must carry (0 none).
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_header_tag(pack: u8, slot: u8) -> u32 {
+    if pack >= 0x20 || keygroup_roots_pack() != pack {
+        return 0;
+    }
+    let value = keygroup_root_byte(slot);
+    if value == KG_ROOT_NONE { 0 } else { value as u32 + 1 }
+}
+
+/// Clear: the slot (and its stereo partner) leaves its set.
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_forget_slot(state: *const u8, pack: u8, slot: u8) {
+    if slot >= 128 || pack >= 0x20 || keygroup_roots_pack() != pack {
+        return;
+    }
+    let mut low = slot;
+    let mut high = slot;
+    if !state.is_null() {
+        if let Some(left) = identified_pair_left(state, pack, slot) {
+            low = left;
+            high = left + 1;
+        }
+    }
+    while low <= high {
+        write_volatile(KG_ROOTS.add(KG_ROOTS_TABLE + low as usize), KG_ROOT_NONE);
+        low += 1;
+    }
+}
+
+/// Main loop: finds the session once and republishes its current project
+/// image each tick (a project load may replace it).
+#[cfg(keygroup_poc)]
+unsafe fn service_keygroup_image() {
+    const IMAGE_POINTER: usize = 0x14;
+    const RETRY_TICKS: u8 = 200;
+
+    if !keygroup_ready() {
+        return;
+    }
+    let session_slot = KG_STATE.add(KG_SESSION).cast::<u32>();
+    let mut session = read_volatile(session_slot);
+    if session <= 1 {
+        let retry = keygroup_state_u8(KG_RETRY);
+        if session == 1 && retry != 0 {
+            keygroup_set_state_u8(KG_RETRY, retry - 1);
+        } else {
+            let found = find_session_object();
+            session = if found.is_null() { 1 } else { found as u32 };
+            write_volatile(session_slot, session);
+            keygroup_set_state_u8(KG_RETRY, RETRY_TICKS);
+        }
+    }
+    let mut image = 0u32;
+    if session > 1 {
+        let candidate = read_u32(session as *const u8, IMAGE_POINTER);
+        if candidate != 0 && read_u32(candidate as *const u8, 4) == KG_IMAGE_SIZE {
+            image = candidate;
+        }
+    }
+    write_volatile(KG_STATE.add(KG_IMAGE).cast::<u32>(), image);
+    #[cfg(keygroup_seed)]
+    if session > 1 {
+        keygroup_seed(session as *const u8);
+    }
+}
+
+/// Test only: follows track 1's current sample `s`. Whenever it is untagged,
+/// the previous seed is removed and `s`, `s + 1`, `s + 2` are tagged as a set
+/// (roots 60, 64, 68: at the default octave C-C# and below play `s`, D-F play
+/// `s + 1`, F# and up play `s + 2`), in RAM only, unless any of them is
+/// already tagged. `KG_ROOTS_SEEDED` holds 1 + the seeded `s` (0 none).
+#[cfg(keygroup_seed)]
+unsafe fn keygroup_seed(session: *const u8) {
+    if keygroup_roots_pack() == 0xff {
+        return;
+    }
+    let sample = session_track_sample(session, 0);
+    if sample > 125 || keygroup_root_byte(sample as u8) != KG_ROOT_NONE {
+        return;
+    }
+    let seeded = read_volatile(KG_ROOTS.add(KG_ROOTS_SEEDED));
+    if seeded != 0 && seeded <= 126 {
+        let previous = KG_ROOTS.add(KG_ROOTS_TABLE + seeded as usize - 1);
+        let mut member = 0;
+        while member < 3 {
+            write_volatile(previous.add(member), KG_ROOT_NONE);
+            member += 1;
+        }
+        write_volatile(KG_ROOTS.add(KG_ROOTS_SEEDED), 0);
+    }
+    let mut member = 1;
+    while member < 3 {
+        if keygroup_root_byte((sample + member) as u8) != KG_ROOT_NONE {
+            return;
+        }
+        member += 1;
+    }
+    let roots = KG_ROOTS.add(KG_ROOTS_TABLE + sample as usize);
+    write_volatile(roots, KG_ROOT_SET_START | 60);
+    write_volatile(roots.add(1), 64);
+    write_volatile(roots.add(2), 68);
+    write_volatile(KG_ROOTS.add(KG_ROOTS_SEEDED), sample as u8 + 1);
+}
+
+#[cfg(keygroup_poc)]
+enum KeygroupNote {
+    /// Not a key-group note: stock plays the track's own sample.
+    Stock,
+    Zone { slot: u8, note: u32 },
+}
+
+/// The member of `sample`'s set that plays `note`, as (slot, root), or `None`
+/// if `sample` is not in a set.
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_set_member(sample: u8, note: u32) -> Option<(u8, u32)> {
+    if sample >= 128 || keygroup_roots_pack() == 0xff {
+        return None;
+    }
+    let state = pair_state();
+    let pack = if state.is_null() { 0xff } else { registry_pack(state) };
+    let right_half = |slot: u8| -> bool {
+        pack < 0x20
+            && matches!(identified_pair_left(state, pack, slot), Some(left) if left != slot)
+    };
+    let mut begin = if right_half(sample) { sample - 1 } else { sample };
+    if keygroup_root_byte(begin) == KG_ROOT_NONE {
+        return None;
+    }
+    while keygroup_root_byte(begin) & KG_ROOT_SET_START == 0 && begin > 0 {
+        let mut previous = begin - 1;
+        if right_half(previous) {
+            if previous == 0 {
+                break;
+            }
+            previous -= 1;
+        }
+        if keygroup_root_byte(previous) == KG_ROOT_NONE {
+            break;
+        }
+        begin = previous;
+    }
+    let mut best: Option<(u8, u32)> = None;
+    let mut best_distance = u32::MAX;
+    let mut slot = begin;
+    while slot < 128 {
+        if right_half(slot) {
+            slot += 1;
+            continue;
+        }
+        let value = keygroup_root_byte(slot);
+        if value == KG_ROOT_NONE || (slot != begin && value & KG_ROOT_SET_START != 0) {
+            break;
+        }
+        let root = (value & 0x7f) as u32;
+        let distance = if note > root { note - root } else { root - note };
+        if distance < best_distance
+            || (distance == best_distance && best.map_or(false, |(_, r)| root > r))
+        {
+            best = Some((slot, root));
+            best_distance = distance;
+        }
+        slot += 1;
+    }
+    best
+}
+
+/// Auto-captured series colours: tan (216,148,82) for mono and sky blue
+/// (68,221,255) for stereo, each with the stock dim shade nearest its hue.
+#[cfg(keygroup_poc)]
+const SERIES_TAN: u16 = 0x6e;
+#[cfg(keygroup_poc)]
+const SERIES_DIM_TAN: u16 = 0x8f;
+#[cfg(keygroup_poc)]
+const SERIES_SKY: u16 = 0x18;
+#[cfg(keygroup_poc)]
+const SERIES_DIM_SKY: u16 = 0x19;
+
+/// The auto-captured series holding `slot`: its first and last slot (pair
+/// halves included) and whether it is stereo. The auto-sampler tags both
+/// halves of a pair, the right one with the left's root and no start bit, so a
+/// stereo series is recognised from the table alone, before its pairs are
+/// registered.
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_series(slot: u8) -> Option<(u8, u8, bool)> {
+    if keygroup_root_byte(slot) == KG_ROOT_NONE {
+        return None;
+    }
+    let mut begin = slot;
+    while keygroup_root_byte(begin) & KG_ROOT_SET_START == 0
+        && begin > 0
+        && keygroup_root_byte(begin - 1) != KG_ROOT_NONE
+    {
+        begin -= 1;
+    }
+    let mut end = slot;
+    while end < 127 {
+        let next = keygroup_root_byte(end + 1);
+        if next == KG_ROOT_NONE || next & KG_ROOT_SET_START != 0 {
+            break;
+        }
+        end += 1;
+    }
+    let stereo =
+        end > begin && keygroup_root_byte(begin + 1) == keygroup_root_byte(begin) & 0x7f;
+    Some((begin, end, stereo))
+}
+
+/// The series colour for `slot` given the selected slot, or `None` if `slot`
+/// is not in a series. The whole series is bright while any member is
+/// selected and `whole` (the series plays as one); otherwise only the selected
+/// slot (and its pair partner) is.
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_series_color(slot: u8, selected: u32, whole: bool) -> Option<u16> {
+    let (begin, end, stereo) = keygroup_series(slot)?;
+    let bright = if whole && selected >= begin as u32 && selected <= end as u32 {
+        true
+    } else if stereo {
+        let left = begin + ((slot - begin) & !1);
+        selected == left as u32 || selected == left as u32 + 1
+    } else {
+        selected == slot as u32
+    };
+    Some(match (stereo, bright) {
+        (true, true) => SERIES_SKY,
+        (true, false) => SERIES_DIM_SKY,
+        (false, true) => SERIES_TAN,
+        (false, false) => SERIES_DIM_TAN,
+    })
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_resolve(track: u32, note: u32) -> KeygroupNote {
+    const TRACK_PARAMETER_GET: usize = 0x0804_6871;
+    const SAMPLE_PARAMETER: u32 = 0;
+    const SLICE_PARAMETER: u32 = 4;
+
+    let Some(index) = track.checked_sub(PLAYBACK_LEADER_TRACK).filter(|i| *i < 8) else {
+        return KeygroupNote::Stock;
+    };
+    if keygroup_track_disabled(index)
+        || keygroup_state_u8(KG_BYPASS) as u32 == index + 1
+        || function::<TrackParameterGet>(TRACK_PARAMETER_GET)(track, SLICE_PARAMETER) != 0
+    {
+        return KeygroupNote::Stock;
+    }
+    let sample = function::<TrackParameterGet>(TRACK_PARAMETER_GET)(track, SAMPLE_PARAMETER);
+    if sample >= 128 {
+        return KeygroupNote::Stock;
+    }
+    match keygroup_set_member(sample as u8, note) {
+        Some((slot, root)) => KeygroupNote::Zone {
+            slot,
+            note: (note + KG_UNITY_NOTE).saturating_sub(root).min(110),
+        },
+        None => KeygroupNote::Stock,
+    }
+}
+
+/// Points voice `index` (and, for a pair, the follower voice) at the given
+/// samples, directly in the engine shadow and the DSP under the audio lock,
+/// leaving the stored track sample untouched.
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_set_voices(index: u32, leader: u8, follower: Option<u8>) {
+    const STOCK_DSP_UPDATE: usize = 0x0804_070f;
+    const LOCK_TAKE: usize = 0x0802_9c8d;
+    const LOCK_GIVE: usize = 0x0803_0eb9;
+    const SAMPLE_PARAMETER: u32 = 0;
+
+    let program = read_volatile(DSP_PROGRAM_STATE);
+    if program == 0 {
+        return;
+    }
+    let update = function::<TrackParameterDspUpdate>(STOCK_DSP_UPDATE);
+    let lock = (program + 0xc) as *mut u8;
+    let mut guard = lock;
+    function::<unsafe extern "C" fn(*mut u8)>(LOCK_TAKE)(lock);
+    update(index, SAMPLE_PARAMETER, leader as u32, 0);
+    if let Some(follower) = follower {
+        update(index + 1, SAMPLE_PARAMETER, follower as u32, 0);
+    }
+    function::<unsafe extern "C" fn(*mut *mut u8)>(LOCK_GIVE)(&mut guard);
+}
+
+/// Note-on entry point: the note to play, or `KG_DROP_NOTE` to drop it.
+///
+/// Kept out of line behind the C ABI: inlined into `paired_playback_note_on`,
+/// rustc 1.99 / LLVM 23 at `opt-level=z` miscompiled the hook (the receiver and
+/// track were never passed on to the calls), which crashed every note-on.
+#[cfg(keygroup_poc)]
+#[inline(never)]
+extern "C" fn keygroup_note_on_hook(track: u32, note: u32) -> u32 {
+    unsafe {
+        let paired = playback_pair_index(track).is_some() && paired_pair_enabled(track);
+        keygroup_note_on(track, note, paired).unwrap_or(KG_DROP_NOTE)
+    }
+}
+
+#[cfg(keygroup_poc)]
+const KG_DROP_NOTE: u32 = u32::MAX;
+
+/// The note at which the voice engine plays a sample at its recorded pitch.
+#[cfg(keygroup_poc)]
+const KG_UNITY_NOTE: u32 = 60;
+
+/// Applies key groups to a note-on before stock sees it. Returns the note to
+/// play, or `None` to drop it. `paired` is whether the note will also be
+/// mirrored to the follower track.
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_note_on(track: u32, note: u32, paired: bool) -> Option<u32> {
+    const TRACK_PARAMETER_GET: usize = 0x0804_6871;
+    const SAMPLE_PARAMETER: u32 = 0;
+
+    if !keygroup_ready() {
+        return Some(note);
+    }
+    let Some(index) = track.checked_sub(PLAYBACK_LEADER_TRACK).filter(|i| *i < 8) else {
+        return Some(note);
+    };
+    let follower = paired && index < 7;
+    let voice = KG_VOICE_SLOT + index as usize;
+    match keygroup_resolve(track, note) {
+        KeygroupNote::Stock => {
+            keygroup_set_state_u8(KG_HELD_NOTE + index as usize, 0xff);
+            let leader_set = keygroup_state_u8(voice) != 0xff;
+            let follower_set = follower && keygroup_state_u8(voice + 1) != 0xff;
+            if leader_set || follower_set {
+                // A voice left on a zone sample is returned to the stored one,
+                // which stock would otherwise only rewrite once it changes.
+                keygroup_set_state_u8(voice, 0xff);
+                if follower {
+                    keygroup_set_state_u8(voice + 1, 0xff);
+                }
+                let get = function::<TrackParameterGet>(TRACK_PARAMETER_GET);
+                let own = get(track, SAMPLE_PARAMETER);
+                let partner = if follower { get(track + 1, SAMPLE_PARAMETER) } else { 0 };
+                if own < 128 && partner < 128 {
+                    keygroup_set_voices(index, own as u8, follower.then_some(partner as u8));
+                }
+            }
+            Some(note)
+        }
+        KeygroupNote::Zone { slot, note: played } => {
+            let (leader_slot, follower_slot) = if follower {
+                let state = pair_state();
+                let pack = if state.is_null() { 0xff } else { registry_pack(state) };
+                match identified_pair_left(state, pack, slot) {
+                    Some(left) => (left, left + 1),
+                    None => (slot, slot),
+                }
+            } else {
+                (slot, slot)
+            };
+            keygroup_set_state_u8(voice, leader_slot);
+            if follower {
+                keygroup_set_state_u8(voice + 1, follower_slot);
+            }
+            keygroup_set_voices(index, leader_slot, follower.then_some(follower_slot));
+            keygroup_set_state_u8(KG_PLAYED_NOTE + index as usize, played as u8);
+            keygroup_set_state_u8(KG_HELD_NOTE + index as usize, note as u8);
+            Some(played)
+        }
+    }
+}
+
+/// Mirrors the note-on remap: the release of the remapped note is sent as the
+/// note that was played; any other release on that track is neutralised,
+/// since stock only acts on a release matching the sounding note.
+#[cfg(keygroup_poc)]
+#[inline(never)]
+extern "C" fn keygroup_note_off(track: u32, note: u32) -> u32 {
+    unsafe { keygroup_note_off_inner(track, note) }
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_note_off_inner(track: u32, note: u32) -> u32 {
+    if !keygroup_ready() {
+        return note;
+    }
+    let Some(index) = track.checked_sub(PLAYBACK_LEADER_TRACK).filter(|i| *i < 8) else {
+        return note;
+    };
+    let held = keygroup_state_u8(KG_HELD_NOTE + index as usize);
+    if held == 0xff {
+        return note;
+    }
+    if held as u32 != note & 0x7f {
+        return KG_NO_NOTE;
+    }
+    keygroup_set_state_u8(KG_HELD_NOTE + index as usize, 0xff);
+    keygroup_state_u8(KG_PLAYED_NOTE + index as usize) as u32
+}
+
+/// The flush of a newly selected sample inside the note-on body would undo a
+/// zone's slot; it is given the zone slot instead.
+#[cfg(keygroup_poc)]
+#[inline(never)]
+extern "C" fn keygroup_flush_value(voice: u32, parameter: u32, value: u32) -> u32 {
+    unsafe { keygroup_flush_value_inner(voice, parameter, value) }
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_flush_value_inner(voice: u32, parameter: u32, value: u32) -> u32 {
+    if parameter != 0 || voice >= 8 || !keygroup_ready() {
+        return value;
+    }
+    let slot = keygroup_state_u8(KG_VOICE_SLOT + voice as usize);
+    if slot < 128 {
+        slot as u32
+    } else {
+        value
+    }
+}
+
+/// Wraps the sample bank's press (vtable `0x08068294` slot 0, `FUN_0805C1AC`),
+/// which selects the pressed sample and previews it synchronously through the
+/// track's note-on. That preview must play the pressed sample, not a zone.
+#[cfg(keygroup_poc)]
+#[no_mangle]
+pub unsafe extern "C" fn keygroup_bank_press(bank: *mut u8, pad: u32, velocity: u32, extra: u32) -> u64 {
+    const STOCK_PRESS: usize = 0x0805_c1ad;
+    const COLOR_BASE: usize = 0x24;
+    const FIRST_COLOR_BASE: u32 = 0x12f;
+
+    let stock = function::<unsafe extern "C" fn(*mut u8, u32, u32, u32) -> u64>(STOCK_PRESS);
+    if bank.is_null() || !keygroup_ready() {
+        return stock(bank, pad, velocity, extra);
+    }
+    let base = read_u16(bank, COLOR_BASE) as u32;
+    let track = base.wrapping_sub(FIRST_COLOR_BASE);
+    if track % 3 != 0 || track / 3 >= 8 {
+        return stock(bank, pad, velocity, extra);
+    }
+    keygroup_set_state_u8(KG_BYPASS, (track / 3 + 1) as u8);
+    let result = stock(bank, pad, velocity, extra);
+    keygroup_set_state_u8(KG_BYPASS, 0);
+    result
+}
+
+#[cfg(keygroup_poc)]
+const KG_SAMPLE_MODE_KIND: u8 = 9;
+/// Sample Mode pad (third pad, top row) with no stock action.
+#[cfg(keygroup_poc)]
+const KG_TOGGLE_PAD: u32 = 2;
+
+/// The page group's selected track (0..8) while it shows Sample Mode for a
+/// track whose sample is in a set, as (track, the track whose off bit applies).
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_sample_mode_track(group: *const u8) -> Option<(u32, u32)> {
+    const OBSERVABLE_READ: usize = 0x0803_fc59;
+    const TRACK_PARAMETER_GET: usize = 0x0804_6871;
+    const SELECTED_TRACK: usize = 0x25c;
+    const KIND: usize = 0x264;
+
+    if group.is_null()
+        || !keygroup_ready()
+        || read_u32(group, 0) != PAGE_GROUP_VTABLE
+        || read_u8(group, KIND) != KG_SAMPLE_MODE_KIND
+    {
+        return None;
+    }
+    let observable = read_u32(group, SELECTED_TRACK);
+    if observable == 0 {
+        return None;
+    }
+    let value = function::<ObservableValue>(OBSERVABLE_READ)(observable, 0);
+    if value.is_null() {
+        return None;
+    }
+    let track = read_volatile(value) as u32;
+    if track >= 8 {
+        return None;
+    }
+    let owner = paired_track_leader_index(track).unwrap_or(track);
+    let sample = function::<TrackParameterGet>(TRACK_PARAMETER_GET)(PLAYBACK_LEADER_TRACK + owner, 0);
+    if sample >= 128 || keygroup_set_member(sample as u8, 60).is_none() {
+        return None;
+    }
+    Some((track, owner))
+}
+
+/// Wraps the page group's press (vtable slot `0x080678DC`, `FUN_0804D7A0`).
+/// Sample Mode pad 2 toggles key groups for the track; the press is swallowed
+/// before stock sets its held bit, so stock's release ignores it. Stock
+/// returns its fourth argument.
+#[cfg(keygroup_poc)]
+#[no_mangle]
+pub unsafe extern "C" fn keygroup_group_press(group: *mut u8, pad: u32, velocity: u32, extra: u32) -> u32 {
+    const STOCK_PRESS: usize = 0x0804_d7a1;
+
+    if pad == KG_TOGGLE_PAD {
+        if let Some((_, owner)) = keygroup_sample_mode_track(group) {
+            keygroup_toggle_track(owner);
+            return extra;
+        }
+    }
+    function::<unsafe extern "C" fn(*mut u8, u32, u32, u32) -> u32>(STOCK_PRESS)(
+        group, pad, velocity, extra,
+    )
+}
+
+/// Lights Sample Mode pad 2 green while key groups are on and dim green while
+/// off, on every track; tracks without a set keep stock's (unlit) pad.
+#[cfg(keygroup_poc)]
+unsafe fn keygroup_sample_mode_light(group: *const u8, pads: *mut u16) {
+    // Fixed palette entries (RGB 0,255,0 and 0,41,0), shared by all tracks.
+    const GREEN: u16 = 0x1e;
+    const DIM_GREEN: u16 = 0x1f;
+
+    if pads.is_null() {
+        return;
+    }
+    let Some((_, owner)) = keygroup_sample_mode_track(group) else {
+        return;
+    };
+    let color = if keygroup_track_disabled(owner) { DIM_GREEN } else { GREEN };
+    write_volatile(pads.add(KG_TOGGLE_PAD as usize), color);
+}
+
+/// Auto-sampler: Sample Rec pad 23 (row 3, pad 8; the length selector only
+/// handles its first five pads) records a multi-sample set from an external
+/// synth. Each take selects the next slot exactly as a pad press does, arms
+/// it with the stock Record toggle, sends a MIDI note, waits for the stock
+/// input threshold to start the capture, holds, releases, records the tail,
+/// stops with the toggle again, trims the take to its sound (see `AS_TRIM_*`)
+/// while the stock writer is held back, and waits for the stock Save. Each
+/// take's
+/// slot is given its root note before the capture starts, so the stock save
+/// stamps the tag into the WAV header; the first take starts the set.
+///
+/// A run starts at the selected empty slot and needs one empty slot per note
+/// (C2..C6 every selected step; pad 21 + row 4 sets the step, pad 22 the hold)
+/// above it (pairs when a stereo pair is armed, which then needs an even
+/// start). It runs on the Main loop, where stock sends MIDI and handles the
+/// Record button. Pad 23 again aborts; a take in progress is kept. A run is
+/// refused when free sample memory is short of its estimate
+/// (`as_run_pages`), and `autosampler_memory_guard` stops any take (run or
+/// manual) just before memory runs out.
+#[cfg(keygroup_poc)]
+const AS_STATE: *mut u8 = 0x2004_fd00 as *mut u8;
+#[cfg(keygroup_poc)]
+const AS_MAGIC: u32 = 0x5341_4d50;
+#[cfg(keygroup_poc)]
+const AS_PHASE: usize = 4;
+#[cfg(keygroup_poc)]
+const AS_TAKE: usize = 5;
+#[cfg(keygroup_poc)]
+const AS_FIRST: usize = 6;
+#[cfg(keygroup_poc)]
+const AS_STEREO: usize = 7;
+#[cfg(keygroup_poc)]
+const AS_REQUEST: usize = 8;
+#[cfg(keygroup_poc)]
+const AS_RESULT: usize = 9;
+#[cfg(keygroup_poc)]
+const AS_NOTE_ON: usize = 10;
+#[cfg(keygroup_poc)]
+const AS_TRUNCATED: usize = 11;
+#[cfg(keygroup_poc)]
+const AS_TIME: usize = 12;
+#[cfg(keygroup_poc)]
+const AS_RESULT_TIME: usize = 16;
+#[cfg(keygroup_poc)]
+const AS_REASON: usize = 20;
+/// Set once the current take's trim stage has run.
+#[cfg(keygroup_poc)]
+const AS_TRIMMED: usize = 21;
+/// Trim scan step: 0/1 lead of left/right, 2/3 tail of left/right.
+#[cfg(keygroup_poc)]
+const AS_SCAN: usize = 22;
+/// Trim-before-save state (`AS_PARK_*` bits).
+#[cfg(keygroup_poc)]
+const AS_PARK: usize = 23;
+/// Frames removed by trimming during this run (one channel).
+#[cfg(keygroup_poc)]
+const AS_TRIM_TOTAL: usize = 24;
+/// Next frame the scan reads.
+#[cfg(keygroup_poc)]
+const AS_SCAN_POS: usize = 28;
+/// Frames in the take (the shorter channel of a pair).
+#[cfg(keygroup_poc)]
+const AS_SCAN_LEN: usize = 32;
+/// First frame at or above the onset level, else `AS_SCAN_LEN`.
+#[cfg(keygroup_poc)]
+const AS_SCAN_LEAD: usize = 36;
+/// One past the last frame at or above the tail level, else 0.
+#[cfg(keygroup_poc)]
+const AS_SCAN_LAST: usize = 40;
+/// When the stock writer was parked.
+#[cfg(keygroup_poc)]
+const AS_PARK_TIME: usize = 44;
+/// Settings, kept until power-off: index into `AS_STEPS`, long note hold,
+/// and whether the step pad (`AS_STEP_PAD`) is held.
+#[cfg(keygroup_poc)]
+const AS_STEP_INDEX: usize = 48;
+#[cfg(keygroup_poc)]
+const AS_LONG_HOLD: usize = 49;
+#[cfg(keygroup_poc)]
+const AS_STEP_HELD: usize = 50;
+/// Series Clear in progress: whether one is, the next slot to examine, the
+/// last slot, the slot the user cleared (handled by its own transaction), and
+/// the Sample Clear UI object the remaining requests are replayed through.
+#[cfg(keygroup_poc)]
+const AS_SERIES_ACTIVE: usize = 51;
+#[cfg(keygroup_poc)]
+const AS_SERIES_NEXT: usize = 52;
+#[cfg(keygroup_poc)]
+const AS_SERIES_END: usize = 53;
+#[cfg(keygroup_poc)]
+const AS_SERIES_SKIP: usize = 54;
+#[cfg(keygroup_poc)]
+const AS_SERIES_UI: usize = 56;
+/// When a Record press was refused or a take stopped for lack of memory
+/// (rows 3-4 flash red), whether that alert is live, whether the guard has
+/// stopped the current take, and when the guard last read memory.
+#[cfg(keygroup_poc)]
+const AS_ALERT_TIME: usize = 60;
+#[cfg(keygroup_poc)]
+const AS_ALERT: usize = 64;
+#[cfg(keygroup_poc)]
+const AS_GUARD_FIRED: usize = 65;
+#[cfg(keygroup_poc)]
+const AS_GUARD_TIME: usize = 68;
+#[cfg(keygroup_poc)]
+const AS_STATE_LEN: usize = 72;
+/// A take is stopped while this many pages remain, ahead of the DSP running
+/// out (a pair then could not be finalized): 0.68 s of a pair, 1.4 s mono.
+#[cfg(keygroup_poc)]
+const AS_GUARD_PAGES: u32 = 16;
+#[cfg(keygroup_poc)]
+const AS_GUARD_READ_MS: u32 = 10;
+/// A Record press needs room for at least 1 s per channel beyond the guard.
+#[cfg(keygroup_poc)]
+const AS_START_PAGES_PER_CHANNEL: u32 = 12;
+#[cfg(keygroup_poc)]
+const AS_ALERT_MS: u32 = 1500;
+/// DSP free-page count (y:$371d1); a page holds 4096 mono frames.
+#[cfg(keygroup_poc)]
+const AS_DSP_FREE_PAGES: u32 = 0x0003_71d1;
+#[cfg(keygroup_poc)]
+const AS_FRAMES_PER_PAGE: u32 = 4096;
+
+/// The take is to be trimmed before its first save.
+#[cfg(keygroup_poc)]
+const AS_PARK_PRESAVE: u8 = 1;
+/// The stock writer is parked (state 1 -> 0) and must be released.
+#[cfg(keygroup_poc)]
+const AS_PARK_HELD: u8 = 2;
+/// Longest the writer may stay parked; past it, the take is saved untrimmed
+/// and trimmed by a rewrite as before.
+#[cfg(keygroup_poc)]
+const AS_PARK_LIMIT_MS: u32 = 2000;
+
+/// Why a run failed, shown on row 4 after a failure: codes 1-8 light that
+/// row-4 pad red, 9-12 light row-4 pad (code - 8) amber.
+#[cfg(keygroup_poc)]
+const AS_FAIL_NO_PACK: u8 = 1;
+#[cfg(keygroup_poc)]
+const AS_FAIL_NOT_READY: u8 = 2;
+#[cfg(keygroup_poc)]
+const AS_FAIL_ODD_PAIR: u8 = 3;
+#[cfg(keygroup_poc)]
+const AS_FAIL_PAST_END: u8 = 4;
+#[cfg(keygroup_poc)]
+const AS_FAIL_SLOTS_USED: u8 = 5;
+#[cfg(keygroup_poc)]
+const AS_FAIL_ARM_TIMEOUT: u8 = 6;
+#[cfg(keygroup_poc)]
+const AS_FAIL_NO_ARM: u8 = 7;
+#[cfg(keygroup_poc)]
+const AS_FAIL_NO_SOUND: u8 = 8;
+#[cfg(keygroup_poc)]
+const AS_FAIL_DESELECTED: u8 = 9;
+#[cfg(keygroup_poc)]
+const AS_FAIL_TRUNCATED: u8 = 10;
+#[cfg(keygroup_poc)]
+const AS_FAIL_SAVE_TIMEOUT: u8 = 11;
+/// Free sample memory is short of the run's estimate.
+#[cfg(keygroup_poc)]
+const AS_FAIL_NO_MEMORY: u8 = 12;
+
+#[cfg(keygroup_poc)]
+const AS_IDLE: u8 = 0;
+#[cfg(keygroup_poc)]
+const AS_SELECT: u8 = 1;
+#[cfg(keygroup_poc)]
+const AS_ARM: u8 = 2;
+#[cfg(keygroup_poc)]
+const AS_ARMING: u8 = 3;
+#[cfg(keygroup_poc)]
+const AS_ONSET: u8 = 4;
+#[cfg(keygroup_poc)]
+const AS_HOLD: u8 = 5;
+#[cfg(keygroup_poc)]
+const AS_TAIL: u8 = 6;
+#[cfg(keygroup_poc)]
+const AS_SAVE: u8 = 7;
+#[cfg(keygroup_poc)]
+const AS_TRIM: u8 = 8;
+
+#[cfg(keygroup_poc)]
+const AS_RESULT_NONE: u8 = 0;
+#[cfg(keygroup_poc)]
+const AS_RESULT_DONE: u8 = 1;
+#[cfg(keygroup_poc)]
+const AS_RESULT_ERROR: u8 = 2;
+
+#[cfg(keygroup_poc)]
+const AS_PAD: u32 = 23;
+/// Row 3 pad 6: held, row 4 picks the semitone step from `AS_STEPS`.
+#[cfg(keygroup_poc)]
+const AS_STEP_PAD: u32 = 21;
+/// Row 3 pad 7: toggles the note hold between `AS_SHORT_HOLD_MS` and
+/// `AS_LONG_HOLD_MS`.
+#[cfg(keygroup_poc)]
+const AS_HOLD_PAD: u32 = 22;
+#[cfg(keygroup_poc)]
+const AS_ROW4: u32 = 24;
+/// C2..C6 (MIDI 36..84, middle C = C4 = 60), every `AS_STEPS[index]`
+/// semitones; each step divides the 48-semitone range.
+#[cfg(keygroup_poc)]
+const AS_FIRST_NOTE: u8 = 36;
+#[cfg(keygroup_poc)]
+const AS_LAST_NOTE: u8 = 84;
+#[cfg(keygroup_poc)]
+const AS_STEPS: [u8; 8] = [1, 2, 3, 4, 6, 8, 12, 24];
+#[cfg(keygroup_poc)]
+const AS_DEFAULT_STEP_INDEX: u8 = 2;
+#[cfg(keygroup_poc)]
+const AS_CHANNEL: u8 = 0;
+#[cfg(keygroup_poc)]
+const AS_VELOCITY: u8 = 100;
+#[cfg(keygroup_poc)]
+const AS_SHORT_HOLD_MS: u32 = 1000;
+#[cfg(keygroup_poc)]
+const AS_LONG_HOLD_MS: u32 = 4000;
+#[cfg(keygroup_poc)]
+const AS_TAIL_MS: u32 = 2000;
+#[cfg(keygroup_poc)]
+const AS_ONSET_TIMEOUT_MS: u32 = 2000;
+#[cfg(keygroup_poc)]
+const AS_ARM_TIMEOUT_MS: u32 = 500;
+#[cfg(keygroup_poc)]
+const AS_ARMING_TIMEOUT_MS: u32 = 1000;
+#[cfg(keygroup_poc)]
+const AS_SETTLE_MS: u32 = 300;
+#[cfg(keygroup_poc)]
+const AS_SAVE_TIMEOUT_MS: u32 = 60_000;
+#[cfg(keygroup_poc)]
+const AS_RESULT_MS: u32 = 2000;
+#[cfg(keygroup_poc)]
+const AS_FAIL_MS: u32 = 6000;
+
+/// Auto-trim. Takes are normalized, so levels are relative to full scale:
+/// sound starts at the first sample at or above -50 dBFS (kept from 1 ms
+/// before it) and ends after the last at or above -60 dBFS (kept for 10 ms
+/// after it). The take is trimmed before its save, which costs nothing; when
+/// that is not possible it is rewritten after the save, only if that removes
+/// at least 2 ms from the start or 100 ms from the end.
+#[cfg(keygroup_poc)]
+const AS_TRIM_ONSET_LEVEL: i32 = 104;
+#[cfg(keygroup_poc)]
+const AS_TRIM_TAIL_LEVEL: i32 = 33;
+#[cfg(keygroup_poc)]
+const AS_TRIM_PRE_FRAMES: u32 = 48;
+#[cfg(keygroup_poc)]
+const AS_TRIM_POST_FRAMES: u32 = 480;
+#[cfg(keygroup_poc)]
+const AS_TRIM_MIN_LEAD: u32 = 96;
+#[cfg(keygroup_poc)]
+const AS_TRIM_MIN_TAIL: u32 = 4800;
+#[cfg(keygroup_poc)]
+const AS_TRIM_MIN_LENGTH: u32 = 1024;
+/// Frames per DSP read; reads are block aligned, so none crosses a DSP page.
+#[cfg(keygroup_poc)]
+const AS_TRIM_BLOCK: u32 = 64;
+/// Blocks read per Main-loop step.
+#[cfg(keygroup_poc)]
+const AS_TRIM_BLOCKS_PER_STEP: u32 = 64;
+#[cfg(keygroup_poc)]
+const AS_FRAMES_PER_SECOND: u32 = 48_000;
+
+/// HAL millisecond tick (`uwTick`, advanced by SysTick through `HAL_IncTick`
+/// with `uwTickFreq` = 1).
+#[cfg(keygroup_poc)]
+const HAL_TICK: *const u32 = 0x2000_0820 as *const u32;
+
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_init() {
+    let mut offset = 4;
+    while offset < AS_STATE_LEN {
+        write_volatile(AS_STATE.add(offset), 0);
+        offset += 1;
+    }
+    write_volatile(AS_STATE.cast::<u32>(), AS_MAGIC);
+    as_set_u8(AS_STEP_INDEX, AS_DEFAULT_STEP_INDEX);
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn as_step() -> u8 {
+    AS_STEPS[(as_u8(AS_STEP_INDEX) & 7) as usize]
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn as_notes() -> u8 {
+    (AS_LAST_NOTE - AS_FIRST_NOTE) / as_step() + 1
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn as_hold_ms() -> u32 {
+    if as_u8(AS_LONG_HOLD) != 0 { AS_LONG_HOLD_MS } else { AS_SHORT_HOLD_MS }
+}
+
+/// Free DSP sample memory in pages of 4096 frames (one channel).
+#[cfg(keygroup_poc)]
+unsafe fn as_free_pages() -> u32 {
+    const DSP_READ: usize = 0x0803_14d7;
+    (function::<DspRead>(DSP_READ)(0, AS_DSP_FREE_PAGES) >> 8) & 0xffff
+}
+
+/// The selected slot is the left of an armed stereo pair.
+#[cfg(keygroup_poc)]
+unsafe fn as_pair_armed(view: *mut u8) -> bool {
+    let first = sample_view_selected_slot(view);
+    read_u8(view, SAMPLE_VIEW_ARMED_LEFT) == first && sample_pair_arm_is_active(first)
+}
+
+/// Pages a run needs: each take records about hold + tail, untrimmed in DSP
+/// memory until the pack reloads, plus page rounding and the guard margin.
+#[cfg(keygroup_poc)]
+unsafe fn as_run_pages(channels: u32) -> u32 {
+    const SLACK_MS: u32 = 500;
+    let frames = (as_hold_ms() + AS_TAIL_MS + SLACK_MS) * (AS_FRAMES_PER_SECOND / 1000);
+    let per_take = frames / AS_FRAMES_PER_PAGE + 2;
+    as_notes() as u32 * channels * per_take + AS_GUARD_PAGES
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn as_alert() {
+    as_set_u8(AS_ALERT, 1);
+    as_stamp(AS_ALERT_TIME);
+}
+
+/// Stock shows the threshold selector on row 3 (and pads 21/22 are free)
+/// only while an empty slot is selected and nothing is armed.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_settings_shown(view: *mut u8) -> bool {
+    const ROW3_SHOWS_SELECTOR: usize = 0x0804_ff99;
+    as_u8(AS_PHASE) == AS_IDLE
+        && view == autosampler_view()
+        && function::<unsafe extern "C" fn(*mut u8) -> u32>(ROW3_SHOWS_SELECTOR)(view) != 0
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_ready() -> bool {
+    read_volatile(AS_STATE.cast::<u32>()) == AS_MAGIC
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn as_u8(offset: usize) -> u8 {
+    read_volatile(AS_STATE.add(offset))
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn as_set_u8(offset: usize, value: u8) {
+    write_volatile(AS_STATE.add(offset), value);
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn as_u32(offset: usize) -> u32 {
+    read_volatile(AS_STATE.add(offset).cast::<u32>())
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn as_set_u32(offset: usize, value: u32) {
+    write_volatile(AS_STATE.add(offset).cast::<u32>(), value);
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn as_now() -> u32 {
+    read_volatile(HAL_TICK)
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn as_elapsed(offset: usize) -> u32 {
+    as_now().wrapping_sub(read_volatile(AS_STATE.add(offset).cast::<u32>()))
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn as_stamp(offset: usize) {
+    write_volatile(AS_STATE.add(offset).cast::<u32>(), as_now());
+}
+
+/// Sample Rec press, before stock: claims pad 23, and the settings pads 21/22
+/// (and row 4 while pad 21 is held) when they are shown or a run is going;
+/// settings change only while idle. Returns 1 if consumed.
+#[cfg(keygroup_poc)]
+#[no_mangle]
+pub unsafe extern "C" fn autosampler_pad_press(view: *mut u8, pad: u32) -> u32 {
+    if !autosampler_ready() {
+        return 0;
+    }
+    if pad == AS_PAD {
+        as_set_u8(AS_REQUEST, 1);
+        return 1;
+    }
+    let shown = autosampler_settings_shown(view);
+    match pad {
+        AS_STEP_PAD | AS_HOLD_PAD if shown || as_u8(AS_PHASE) != AS_IDLE => {
+            if shown && pad == AS_STEP_PAD {
+                as_set_u8(AS_STEP_HELD, 1);
+            } else if shown {
+                as_set_u8(AS_LONG_HOLD, (as_u8(AS_LONG_HOLD) == 0) as u8);
+            }
+            1
+        }
+        _ if (AS_ROW4..AS_ROW4 + 8).contains(&pad) && shown && as_u8(AS_STEP_HELD) != 0 => {
+            as_set_u8(AS_STEP_INDEX, (pad - AS_ROW4) as u8);
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// Sample Rec release, after stock (which acts only on its previewed slot pad).
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_pad_release(pad: u32) {
+    if pad == AS_STEP_PAD && autosampler_ready() {
+        as_set_u8(AS_STEP_HELD, 0);
+    }
+}
+
+#[cfg(not(keygroup_poc))]
+#[no_mangle]
+pub unsafe extern "C" fn autosampler_pad_press(_view: *mut u8, _pad: u32) -> u32 {
+    0
+}
+
+/// The UI objects the auto-sampler drives: the Sample Rec view (UI root
+/// `+0x58`, rec-state observable at `+0x48`) and the Record button (UI root
+/// `+0x60`). The Record press (`0x08050250`, button `0x10`) on this page
+/// runs command `+0x24`, then, unless idle, the forwarded toggle `+0x28`;
+/// the auto-sampler presses it exactly so, and the state follows later.
+#[cfg(keygroup_poc)]
+struct AutoSampler {
+    view: *mut u8,
+    button: u32,
+    state: u32,
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_view() -> *mut u8 {
+    const UI_REGISTRATION: *const u32 = 0x2000_6ea0 as *const u32;
+    const SAMPLE_VIEW: usize = 0x58;
+
+    let root = read_volatile(UI_REGISTRATION.add(1)) as *const u8;
+    if root.is_null() {
+        return core::ptr::null_mut();
+    }
+    let view = read_u32(root, SAMPLE_VIEW) as *mut u8;
+    if sample_view_extension_valid(view) { view } else { core::ptr::null_mut() }
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_objects() -> Option<AutoSampler> {
+    const UI_REGISTRATION: *const u32 = 0x2000_6ea0 as *const u32;
+    const RECORD_BUTTON: usize = 0x60;
+    const RECORD_BUTTON_VTABLE: u32 = 0x0806_7cac;
+    const TOGGLE_COMMAND: usize = 0x28;
+    const REC_STATE: usize = 0x48;
+
+    let view = autosampler_view();
+    if view.is_null() {
+        return None;
+    }
+    let root = read_volatile(UI_REGISTRATION.add(1)) as *const u8;
+    let button = read_u32(root, RECORD_BUTTON) as *const u8;
+    if button.is_null() || read_u32(button, 0) != RECORD_BUTTON_VTABLE {
+        return None;
+    }
+    let state = read_u32(view, REC_STATE);
+    if read_u32(button, TOGGLE_COMMAND) == 0 || state == 0 {
+        return None;
+    }
+    Some(AutoSampler { view, button: button as u32, state })
+}
+
+#[cfg(keygroup_poc)]
+impl AutoSampler {
+    unsafe fn rec_state(&self) -> u8 {
+        let value = function::<ObservableValue>(0x0803_fc59)(self.state, 0);
+        if value.is_null() { 0xff } else { read_volatile(value) }
+    }
+
+    /// The stock Record press on the Sample Rec page.
+    unsafe fn toggle(&self) {
+        const RECORD_PRESS: usize = 0x0805_0251;
+        const RECORD: u32 = 0x10;
+        function::<FirmwareMethod4>(RECORD_PRESS)(self.button, RECORD, 0, 0);
+    }
+
+    unsafe fn selected(&self) -> u8 {
+        sample_view_selected_slot(self.view)
+    }
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_midi(status: u8, note: u8, velocity: u8) {
+    const MIDI_SEND: usize = 0x0804_68fb;
+    const ALL_PORTS: u32 = 7;
+
+    let message = [status | AS_CHANNEL, note, velocity];
+    function::<unsafe extern "C" fn(u32, *const u8) -> u32>(MIDI_SEND)(ALL_PORTS, message.as_ptr());
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_note() -> u8 {
+    AS_FIRST_NOTE + as_step() * as_u8(AS_TAKE)
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_slot() -> u8 {
+    let stride = if as_u8(AS_STEREO) != 0 { 2 } else { 1 };
+    as_u8(AS_FIRST) + stride * as_u8(AS_TAKE)
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_note_off() {
+    if as_u8(AS_NOTE_ON) != 0 {
+        autosampler_midi(0x80, autosampler_note(), 0);
+        as_set_u8(AS_NOTE_ON, 0);
+    }
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_tag(value: u8) {
+    let slot = autosampler_slot() as usize;
+    write_volatile(KG_ROOTS.add(KG_ROOTS_TABLE + slot), value);
+    if as_u8(AS_STEREO) != 0 {
+        let partner = if value == KG_ROOT_NONE { value } else { value & 0x7f };
+        write_volatile(KG_ROOTS.add(KG_ROOTS_TABLE + slot + 1), partner);
+    }
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_finish(result: u8) {
+    // The arm token is left alone: a stereo take still saving needs it, and
+    // its terminal publication retires it as usual.
+    autosampler_note_off();
+    autosampler_release_writer();
+    as_set_u8(AS_PARK, 0);
+    as_set_u8(AS_PHASE, AS_IDLE);
+    as_set_u8(AS_RESULT, result);
+    as_stamp(AS_RESULT_TIME);
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_fail(reason: u8) {
+    as_set_u8(AS_REASON, reason);
+    autosampler_finish(AS_RESULT_ERROR);
+}
+
+/// Validates and starts a run from the selected slot.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_start(objects: &AutoSampler) -> u8 {
+    if keygroup_roots_pack() == 0xff {
+        return AS_FAIL_NO_PACK;
+    }
+    let first = objects.selected();
+    if first >= 128 || objects.rec_state() != 1 {
+        return AS_FAIL_NOT_READY;
+    }
+    let stereo = as_pair_armed(objects.view);
+    if stereo && first & 1 != 0 {
+        return AS_FAIL_ODD_PAIR;
+    }
+    let span = as_notes() as u32 * if stereo { 2 } else { 1 };
+    if first as u32 + span > 128 {
+        return AS_FAIL_PAST_END;
+    }
+    let mut slot = first;
+    while (slot as u32) < first as u32 + span {
+        if sample_view_slot_occupied(objects.view, slot) || keygroup_root_byte(slot) != KG_ROOT_NONE {
+            return AS_FAIL_SLOTS_USED;
+        }
+        slot += 1;
+    }
+    if as_free_pages() < as_run_pages(if stereo { 2 } else { 1 }) {
+        return AS_FAIL_NO_MEMORY;
+    }
+    as_set_u8(AS_FIRST, first);
+    as_set_u8(AS_STEREO, stereo as u8);
+    as_set_u8(AS_TAKE, 0);
+    as_set_u8(AS_NOTE_ON, 0);
+    as_set_u8(AS_TRUNCATED, 0);
+    as_set_u8(AS_RESULT, AS_RESULT_NONE);
+    as_set_u8(AS_REASON, 0);
+    as_set_u8(AS_TRIMMED, 0);
+    as_set_u32(AS_TRIM_TOTAL, 0);
+    as_set_u8(AS_PHASE, AS_SELECT);
+    0
+}
+
+/// Pad 23 during a run: stop. A capture in progress is finalized and kept;
+/// one still waiting for the threshold is cancelled and untagged.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_abort(objects: &AutoSampler) {
+    let phase = as_u8(AS_PHASE);
+    if (AS_ARM..AS_SAVE).contains(&phase) && objects.selected() == autosampler_slot() {
+        match objects.rec_state() {
+            2 => {
+                objects.toggle();
+                autosampler_tag(KG_ROOT_NONE);
+            }
+            3 => objects.toggle(),
+            _ => {}
+        }
+    }
+    autosampler_finish(AS_RESULT_NONE);
+}
+
+/// One Main-loop step of the run.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_step(objects: &AutoSampler) {
+    let phase = as_u8(AS_PHASE);
+    let slot = autosampler_slot();
+    let state = objects.rec_state();
+    // Anything else selecting a slot (a pad press) ends the run; stock has
+    // already finalized or cancelled the take.
+    if (AS_ARMING..AS_SAVE).contains(&phase) && objects.selected() != slot {
+        if phase <= AS_ONSET {
+            autosampler_tag(KG_ROOT_NONE);
+        }
+        autosampler_fail(AS_FAIL_DESELECTED);
+        return;
+    }
+    match phase {
+        AS_SELECT => {
+            sample_pair_clear_arm_token();
+            write_u8(objects.view, SAMPLE_VIEW_ARMED_LEFT, SAMPLE_VIEW_NO_ARM);
+            sample_pair_gesture_select_canonical(objects.view, slot as u32);
+            as_set_u8(AS_TRIMMED, 0);
+            as_set_u8(AS_PARK, 0);
+            as_stamp(AS_TIME);
+            as_set_u8(AS_PHASE, AS_ARM);
+        }
+        AS_ARM => {
+            if objects.selected() != slot || state != 1 {
+                if as_elapsed(AS_TIME) > AS_ARM_TIMEOUT_MS {
+                    autosampler_fail(AS_FAIL_ARM_TIMEOUT);
+                }
+                return;
+            }
+            if as_u8(AS_STEREO) != 0 {
+                write_u8(objects.view, SAMPLE_VIEW_ARMED_LEFT, slot);
+                sample_pair_publish_arm_token(slot);
+                let pair = pair_state();
+                if !pair.is_null() {
+                    write_u32(pair, STATE_DEFERRED_REFRESH_VIEW, objects.view as u32);
+                }
+            }
+            let root = autosampler_note();
+            autosampler_tag(if as_u8(AS_TAKE) == 0 { root | KG_ROOT_SET_START } else { root });
+            objects.toggle();
+            as_stamp(AS_TIME);
+            as_set_u8(AS_PHASE, AS_ARMING);
+        }
+        AS_ARMING => {
+            if !matches!(state, 2 | 3) {
+                if as_elapsed(AS_TIME) > AS_ARMING_TIMEOUT_MS {
+                    autosampler_tag(KG_ROOT_NONE);
+                    autosampler_fail(AS_FAIL_NO_ARM);
+                }
+                return;
+            }
+            autosampler_midi(0x90, autosampler_note(), AS_VELOCITY);
+            as_set_u8(AS_NOTE_ON, 1);
+            as_stamp(AS_TIME);
+            as_set_u8(AS_PHASE, AS_ONSET);
+        }
+        AS_ONSET => match state {
+            3 => as_set_u8(AS_PHASE, AS_HOLD),
+            2 if as_elapsed(AS_TIME) <= AS_ONSET_TIMEOUT_MS => {}
+            _ => {
+                // Nothing crossed the threshold: no audio from the synth.
+                if state == 2 {
+                    objects.toggle();
+                }
+                autosampler_tag(KG_ROOT_NONE);
+                autosampler_fail(AS_FAIL_NO_SOUND);
+            }
+        },
+        AS_HOLD | AS_TAIL => {
+            if state != 3 {
+                // Stock stopped the capture: sample memory or the slot is full.
+                autosampler_note_off();
+                as_set_u8(AS_TRUNCATED, 1);
+                as_stamp(AS_TIME);
+                as_set_u8(AS_PHASE, AS_SAVE);
+            } else if phase == AS_HOLD && as_elapsed(AS_TIME) >= as_hold_ms() {
+                autosampler_note_off();
+                as_stamp(AS_TIME);
+                as_set_u8(AS_PHASE, AS_TAIL);
+            } else if phase == AS_TAIL && as_elapsed(AS_TIME) >= AS_TAIL_MS {
+                objects.toggle();
+                as_set_u8(AS_PARK, AS_PARK_PRESAVE);
+                as_stamp(AS_TIME);
+                as_set_u8(AS_PHASE, AS_SAVE);
+            }
+        }
+        AS_SAVE => {
+            if as_u8(AS_PARK) & AS_PARK_PRESAVE != 0 {
+                autosampler_presave(slot, state);
+                return;
+            }
+            autosampler_drain_writer(slot, state);
+            let elapsed = as_elapsed(AS_TIME);
+            if elapsed > AS_SAVE_TIMEOUT_MS {
+                autosampler_fail(AS_FAIL_SAVE_TIMEOUT);
+                return;
+            }
+            let pending = sample_slot_save_pending(slot)
+                || (as_u8(AS_STEREO) != 0 && sample_slot_save_pending(slot + 1));
+            if state == 3 || pending || elapsed < AS_SETTLE_MS {
+                if pending {
+                    as_stamp(AS_TIME);
+                }
+                return;
+            }
+            if as_u8(AS_TRUNCATED) != 0 {
+                autosampler_fail(AS_FAIL_TRUNCATED);
+                return;
+            }
+            if as_u8(AS_TRIMMED) == 0 {
+                as_set_u8(AS_TRIMMED, 1);
+                if autosampler_trim_begin(slot) {
+                    as_set_u8(AS_PHASE, AS_TRIM);
+                    return;
+                }
+            }
+            let next = as_u8(AS_TAKE) + 1;
+            if next >= as_notes() {
+                autosampler_finish(AS_RESULT_DONE);
+                return;
+            }
+            as_set_u8(AS_TAKE, next);
+            as_set_u8(AS_PHASE, AS_SELECT);
+        }
+        AS_TRIM => {
+            if as_u8(AS_PARK) & AS_PARK_PRESAVE != 0 && !autosampler_park_writer(slot) {
+                // The take is being saved untrimmed: scan again after it.
+                autosampler_presave_abandon();
+                as_set_u8(AS_TRIMMED, 0);
+                as_stamp(AS_TIME);
+                as_set_u8(AS_PHASE, AS_SAVE);
+                return;
+            }
+            if autosampler_trim_step(slot) {
+                // Before the save, the held writer now saves the trimmed take;
+                // after it, a rewrite was requested (or nothing to trim). Wait
+                // for it as for the take's own save, then move on.
+                autosampler_release_writer();
+                as_set_u8(AS_PARK, 0);
+                as_stamp(AS_TIME);
+                as_set_u8(AS_PHASE, AS_SAVE);
+            }
+        }
+        _ => as_set_u8(AS_PHASE, AS_IDLE),
+    }
+}
+
+/// The stock sample writer (`*0x20000828`, serviced by
+/// `Sampling_ServiceWriterState` 0x0802F256) copies a finished take to SD at
+/// 256 frames per call, and its Main-loop timer calls it only every third
+/// tick: about 11,600 frames/s, so a 3 s take took 12.5 s to save (timed over
+/// USB MIDI). The auto-sampler is waiting on that save anyway, so it calls the
+/// same service from the same Main loop while the writer is reading (state 1).
+/// The writer leaves state 1 the moment it hands a 2,048-frame block to the
+/// storage task, which bounds each burst to one SD write.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_drain_writer(slot: u8, rec_state: u8) {
+    const WRITER: *const u32 = 0x2000_0828 as *const u32;
+    const SERVICE_WRITER: usize = 0x0802_f257;
+    const STATE_READING: u8 = 1;
+    const SLOT: usize = 0x24;
+    const MAX_CALLS: u32 = 8;
+
+    if rec_state == 3 {
+        return;
+    }
+    let writer = read_volatile(WRITER) as *mut u8;
+    if writer.is_null() {
+        return;
+    }
+    let state = read_u32(writer, 4) as *const u8;
+    if state.is_null() {
+        return;
+    }
+    let target = read_u8(state, SLOT);
+    if target != slot && !(as_u8(AS_STEREO) != 0 && target == slot + 1) {
+        return;
+    }
+    for _ in 0..MAX_CALLS {
+        if read_volatile(state.add(1)) != STATE_READING {
+            return;
+        }
+        function::<unsafe extern "C" fn(*mut u8, u32, u32) -> u32>(SERVICE_WRITER)(writer, 0, 0);
+    }
+}
+
+/// Trim before save. After the stop, stock requests a save of the slot; once
+/// the file is open (callback `0x0802F3E0`) the writer enters state 1 and
+/// pumps the slot through the capture window, re-reading the slot's length
+/// (`+4`) on every pass. While it has written nothing, setting it back to 0
+/// (the state between request and open) holds it with no other effect; the
+/// at most one 256-frame read it has buffered is dropped (`+0x2C`). The take
+/// is then trimmed in DSP memory as stock's crop does, and the released
+/// writer saves the trimmed take.
+#[cfg(keygroup_poc)]
+const WRITER_FRAMES_WRITTEN: usize = 8;
+#[cfg(keygroup_poc)]
+const WRITER_SLOT: usize = 0x24;
+#[cfg(keygroup_poc)]
+const WRITER_FRAMES_BUFFERED: usize = 0x2c;
+
+/// The stock writer's job struct, if it belongs to this take.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_writer_job(slot: u8) -> *mut u8 {
+    const WRITER: *const u32 = 0x2000_0828 as *const u32;
+    let writer = read_volatile(WRITER) as *const u8;
+    if writer.is_null() {
+        return core::ptr::null_mut();
+    }
+    let job = read_u32(writer, 4) as *mut u8;
+    if job.is_null() {
+        return job;
+    }
+    let target = read_u8(job, WRITER_SLOT);
+    if target == slot || (as_u8(AS_STEREO) != 0 && target == slot + 1) {
+        job
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
+/// Holds the writer if it has started on this take. False once it has
+/// written (or is writing) any of it: too late to trim before the save.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_park_writer(slot: u8) -> bool {
+    let job = autosampler_writer_job(slot);
+    if job.is_null() {
+        return true;
+    }
+    let state = read_volatile(job.add(1));
+    if read_u32(job, WRITER_FRAMES_WRITTEN) != 0 || state > 1 {
+        return false;
+    }
+    if state == 1 {
+        write_volatile(job.add(1), 0);
+        write_u32(job, WRITER_FRAMES_BUFFERED, 0);
+        if as_u8(AS_PARK) & AS_PARK_HELD == 0 {
+            as_set_u8(AS_PARK, as_u8(AS_PARK) | AS_PARK_HELD);
+            as_stamp(AS_PARK_TIME);
+        }
+    }
+    true
+}
+
+/// Lets a held writer go on.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_release_writer() {
+    if as_u8(AS_PARK) & AS_PARK_HELD == 0 {
+        return;
+    }
+    as_set_u8(AS_PARK, as_u8(AS_PARK) & !AS_PARK_HELD);
+    let job = autosampler_writer_job(autosampler_slot());
+    if !job.is_null() && read_volatile(job.add(1)) == 0 {
+        write_volatile(job.add(1), 1);
+    }
+}
+
+/// Gives up trimming before the save: the take is saved as recorded and, if
+/// no scan has run yet, trimmed by a rewrite afterwards.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_presave_abandon() {
+    autosampler_release_writer();
+    as_set_u8(AS_PARK, 0);
+}
+
+/// Releases a writer held too long, or while the run is not being stepped
+/// (the Sample Rec view is gone), so a save can never be stalled for good.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_park_guard(stepping: bool) {
+    if as_u8(AS_PARK) & AS_PARK_HELD != 0
+        && (!stepping || as_elapsed(AS_PARK_TIME) > AS_PARK_LIMIT_MS)
+    {
+        autosampler_presave_abandon();
+        if as_u8(AS_PHASE) == AS_TRIM {
+            as_set_u8(AS_TRIMMED, 0);
+            as_stamp(AS_TIME);
+            as_set_u8(AS_PHASE, AS_SAVE);
+        }
+    }
+}
+
+/// Stock normalizes a take destructively after the stop; the slot's readable
+/// frontier (capture `+0x38`, `Y:$30003+4*slot`) reaches its length when that
+/// is done, and the busy flag (capture `+0x34`) is clear. The writer waits
+/// for both, and so must the scan, whose levels assume a normalized take.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_normalized(capture: *mut u8, slot: u8) -> bool {
+    const BUSY: usize = 0x0806_455f;
+    const FRONTIER: usize = 0x0806_45b1;
+    if function::<unsafe extern "C" fn(*mut u8) -> u32>(BUSY)(capture) != 0 {
+        return false;
+    }
+    let channels = if as_u8(AS_STEREO) != 0 { 2 } else { 1 };
+    let mut channel = 0;
+    while channel < channels {
+        let target = slot + channel;
+        let length = autosampler_slot_length(capture, target) & !0xff;
+        let frontier =
+            function::<unsafe extern "C" fn(*mut u8, u32) -> u32>(FRONTIER)(capture, target as u32);
+        if length == 0 || frontier < length {
+            return false;
+        }
+        channel += 1;
+    }
+    true
+}
+
+/// `AS_SAVE` before the take's save: hold the writer until the take is
+/// normalized, then start the trim scan.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_presave(slot: u8, rec_state: u8) {
+    if !autosampler_park_writer(slot) || as_elapsed(AS_TIME) > AS_PARK_LIMIT_MS {
+        autosampler_presave_abandon();
+        return;
+    }
+    if rec_state == 3 {
+        return;
+    }
+    let capture = autosampler_capture();
+    if capture.is_null() {
+        autosampler_presave_abandon();
+        return;
+    }
+    if !autosampler_normalized(capture, slot) {
+        return;
+    }
+    as_set_u8(AS_TRIMMED, 1);
+    if autosampler_trim_begin(slot) {
+        as_set_u8(AS_PHASE, AS_TRIM);
+    } else {
+        autosampler_presave_abandon();
+    }
+}
+
+/// The capture object (`*0x20006F24`, vtable `0x08066E58`): slot length
+/// (`+4`), ring map (`+8`) and loop window (`+0x2C`/`+0x30`).
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_capture() -> *mut u8 {
+    const CAPTURE: *const u32 = 0x2000_6f24 as *const u32;
+    const CAPTURE_VTABLE: u32 = 0x0806_6e58;
+
+    let capture = read_volatile(CAPTURE) as *mut u8;
+    if capture.is_null() || read_u32(capture, 0) != CAPTURE_VTABLE {
+        core::ptr::null_mut()
+    } else {
+        capture
+    }
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_slot_length(capture: *mut u8, slot: u8) -> u32 {
+    const GET_SLOT_LENGTH: usize = 0x0806_438d;
+    function::<unsafe extern "C" fn(*mut u8, u32) -> u32>(GET_SLOT_LENGTH)(capture, slot as u32)
+}
+
+/// Reads `count` (<= `AS_TRIM_BLOCK`) frames of a slot from DSP memory,
+/// starting at a block-aligned frame, as the save pump does.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_read_block(capture: *mut u8, slot: u8, frame: u32, buffer: *mut i16, count: u32) {
+    const MAP_RING_POSITION: usize = 0x0806_43c5;
+    let physical = function::<unsafe extern "C" fn(*mut u8, u32, u32) -> u32>(MAP_RING_POSITION)(
+        capture,
+        slot as u32,
+        frame,
+    );
+    native_stock_capture_chunk_read(capture, physical, buffer, count);
+}
+
+/// Starts the trim scan of the take just recorded. Returns false if it cannot run.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_trim_begin(slot: u8) -> bool {
+    let capture = autosampler_capture();
+    if capture.is_null() {
+        return false;
+    }
+    let mut length = autosampler_slot_length(capture, slot);
+    if as_u8(AS_STEREO) != 0 {
+        length = length.min(autosampler_slot_length(capture, slot + 1));
+    }
+    if length < AS_TRIM_MIN_LENGTH || length > 0x0100_0000 {
+        return false;
+    }
+    as_set_u32(AS_SCAN_LEN, length);
+    as_set_u32(AS_SCAN_LEAD, length);
+    as_set_u32(AS_SCAN_LAST, 0);
+    as_set_u32(AS_SCAN_POS, 0);
+    as_set_u8(AS_SCAN, 0);
+    true
+}
+
+/// Moves the scan to `step`, positioned for it.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_trim_next(step: u8) {
+    as_set_u8(AS_SCAN, step);
+    let position = if step >= 2 {
+        (as_u32(AS_SCAN_LEN) - 1) & !(AS_TRIM_BLOCK - 1)
+    } else {
+        0
+    };
+    as_set_u32(AS_SCAN_POS, position);
+}
+
+/// One Main-loop step of the trim scan. Both halves of a pair are scanned
+/// and trimmed to one window, so they stay aligned. Returns true when done.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_trim_step(slot: u8) -> bool {
+    let capture = autosampler_capture();
+    if capture.is_null() {
+        return true;
+    }
+    let stereo = as_u8(AS_STEREO) != 0;
+    let length = as_u32(AS_SCAN_LEN);
+    // Filled by each read before it is examined (zeroing it would need memclr).
+    let mut storage = core::mem::MaybeUninit::<[i16; AS_TRIM_BLOCK as usize]>::uninit();
+    let buffer = storage.as_mut_ptr().cast::<i16>();
+    let mut budget = AS_TRIM_BLOCKS_PER_STEP;
+    while budget > 0 {
+        budget -= 1;
+        let step = as_u8(AS_SCAN);
+        if step >= 4 {
+            autosampler_trim_apply(capture, slot, stereo);
+            return true;
+        }
+        let channel = slot + (step & 1);
+        if step & 1 == 1 && !stereo {
+            autosampler_trim_next(step + 1);
+            continue;
+        }
+        let position = as_u32(AS_SCAN_POS);
+        if step < 2 {
+            // Onset: forward, only as far as an onset already found.
+            let lead = as_u32(AS_SCAN_LEAD);
+            if position >= lead {
+                autosampler_trim_next(step + 1);
+                continue;
+            }
+            let count = (length - position).min(AS_TRIM_BLOCK);
+            autosampler_read_block(capture, channel, position, buffer, count);
+            let mut index = 0;
+            while index < count {
+                if (read_volatile(buffer.add(index as usize)) as i32).abs() >= AS_TRIM_ONSET_LEVEL {
+                    as_set_u32(AS_SCAN_LEAD, lead.min(position + index));
+                    break;
+                }
+                index += 1;
+            }
+            if index < count {
+                autosampler_trim_next(step + 1);
+            } else {
+                as_set_u32(AS_SCAN_POS, position + count);
+            }
+        } else {
+            // Tail: backward, only as far back as a tail already found.
+            let last = as_u32(AS_SCAN_LAST);
+            if position + AS_TRIM_BLOCK <= last {
+                autosampler_trim_next(step + 1);
+                continue;
+            }
+            let count = (length - position).min(AS_TRIM_BLOCK);
+            autosampler_read_block(capture, channel, position, buffer, count);
+            let mut index = count;
+            let mut found = false;
+            while index > 0 {
+                index -= 1;
+                if (read_volatile(buffer.add(index as usize)) as i32).abs() >= AS_TRIM_TAIL_LEVEL {
+                    as_set_u32(AS_SCAN_LAST, last.max(position + index + 1));
+                    found = true;
+                    break;
+                }
+            }
+            if found || position == 0 {
+                autosampler_trim_next(step + 1);
+            } else {
+                as_set_u32(AS_SCAN_POS, position - AS_TRIM_BLOCK);
+            }
+        }
+    }
+    false
+}
+
+/// Trims the take to its sound the way stock's crop and fixed-length
+/// recording do: set the slot's window (start, length) live, commit it
+/// (the DSP compacts the slot). Before the save, the held writer then saves
+/// the compacted slot; after it, a stock save is queued, which rewrites the
+/// file from the compacted slot. Called directly, not through the vtable,
+/// so the crop mirror does not also fire.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_trim_apply(capture: *mut u8, slot: u8, stereo: bool) {
+    const SET_LOOP_WINDOW: usize = 0x0806_44e5;
+    const SET_LOOP_WINDOW_WAIT: usize = 0x0806_4513;
+    const STOCK_SAVE_REQUEST: usize = 0x0803_5057;
+    type Window = unsafe extern "C" fn(*mut u8, u32, u32, u32) -> u32;
+    type SaveRequest = unsafe extern "C" fn(*mut u8, u32) -> u32;
+
+    let length = as_u32(AS_SCAN_LEN);
+    let lead = as_u32(AS_SCAN_LEAD);
+    let last = as_u32(AS_SCAN_LAST);
+    if last == 0 || lead >= last {
+        return;
+    }
+    let start = lead.saturating_sub(AS_TRIM_PRE_FRAMES);
+    let end = (last + AS_TRIM_POST_FRAMES).min(length);
+    let kept = end - start;
+    // Before the save a trim costs nothing; after it, it costs a rewrite.
+    let presave = as_u8(AS_PARK) & AS_PARK_PRESAVE != 0;
+    if kept < AS_TRIM_MIN_LENGTH
+        || (!presave && start < AS_TRIM_MIN_LEAD && length - end < AS_TRIM_MIN_TAIL)
+        || (start == 0 && end == length)
+    {
+        return;
+    }
+    let controller = read_volatile(SAVE_CALLBACK_REGISTRATION.add(1)) as *mut u8;
+    if controller.is_null() {
+        return;
+    }
+    let channels = if stereo { 2 } else { 1 };
+    let mut channel = 0;
+    while channel < channels {
+        let target = (slot + channel) as u32;
+        function::<Window>(SET_LOOP_WINDOW)(capture, target, start, kept);
+        function::<Window>(SET_LOOP_WINDOW_WAIT)(capture, target, start, kept);
+        channel += 1;
+    }
+    let mut channel = 0;
+    while channel < channels && !presave {
+        function::<SaveRequest>(STOCK_SAVE_REQUEST)(controller, (slot + channel) as u32);
+        channel += 1;
+    }
+    as_set_u32(AS_TRIM_TOTAL, as_u32(AS_TRIM_TOTAL).saturating_add(length - kept));
+}
+
+/// Draws pads 21-23 into the Sample Rec view's composed output (render hook).
+/// Stock shows the threshold selector's eight cells on row 3 only while an
+/// empty slot is selected and nothing is armed (`0x0804FF98`); the pads are
+/// drawn then (pad 21 teal, bright while held, with row 4 showing the eight
+/// steps, the current one bright; pad 22 dim white for the short hold, white
+/// for the long), and pad 23 over the capture time bar while a run is going or its
+/// result shows: dim amber idle, amber running (flashing while waiting for
+/// sound); for six seconds after a run, green with the seconds trimmed on
+/// row 4, or red with the failure reason on row 4 (see `AS_FAIL_*`). A fast
+/// red flash means the Record objects were not found.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_overlay(view: *mut u8, output: *mut u16) {
+    const AMBER: u16 = 0x2b;
+    const DIM_AMBER: u16 = 0x2c;
+    const GREEN: u16 = 0x1e;
+    const RED: u16 = 0x55;
+    const WHITE: u16 = 0x01;
+    const DIM_WHITE: u16 = 0x09;
+    const TEAL: u16 = 0x25;
+    const DIM_TEAL: u16 = 0x26;
+
+    if output.is_null() || !autosampler_ready() || view != autosampler_view() {
+        return;
+    }
+    let settings = autosampler_settings_shown(view);
+    if !settings {
+        as_set_u8(AS_STEP_HELD, 0);
+    }
+    if as_u8(AS_ALERT) != 0 {
+        if as_elapsed(AS_ALERT_TIME) < AS_ALERT_MS {
+            for pad in 16..32 {
+                write_volatile(output.add(pad), RED);
+            }
+            return;
+        }
+        as_set_u8(AS_ALERT, 0);
+    }
+    let phase = as_u8(AS_PHASE);
+    let result = as_u8(AS_RESULT);
+    let shown_for = if result == AS_RESULT_NONE { AS_RESULT_MS } else { AS_FAIL_MS };
+    let showing_result = result != AS_RESULT_NONE && as_elapsed(AS_RESULT_TIME) < shown_for;
+    if phase == AS_IDLE && !showing_result && !settings {
+        return;
+    }
+    let color = if phase == AS_ONSET {
+        if as_now() & 0x100 != 0 { AMBER } else { DIM_AMBER }
+    } else if phase != AS_IDLE {
+        AMBER
+    } else if showing_result {
+        if result == AS_RESULT_DONE { GREEN } else { RED }
+    } else if autosampler_objects().is_none() {
+        if as_now() & 0x80 != 0 { RED } else { 0 }
+    } else {
+        DIM_AMBER
+    };
+    write_volatile(output.add(AS_PAD as usize), color);
+    const ROW4: usize = AS_ROW4 as usize;
+    if settings {
+        let held = as_u8(AS_STEP_HELD) != 0;
+        write_volatile(output.add(AS_STEP_PAD as usize), if held { TEAL } else { DIM_TEAL });
+        let long = as_u8(AS_LONG_HOLD) != 0;
+        write_volatile(output.add(AS_HOLD_PAD as usize), if long { WHITE } else { DIM_WHITE });
+        if held {
+            let selected = (as_u8(AS_STEP_INDEX) & 7) as usize;
+            let mut pad = 0;
+            while pad < 8 {
+                write_volatile(output.add(ROW4 + pad), if pad == selected { TEAL } else { DIM_TEAL });
+                pad += 1;
+            }
+            return;
+        }
+    }
+    let reason = as_u8(AS_REASON);
+    if phase == AS_IDLE && showing_result && result == AS_RESULT_ERROR && (1..=12).contains(&reason) {
+        let mut pad = 0;
+        while pad < 8 {
+            write_volatile(output.add(ROW4 + pad), 0);
+            pad += 1;
+        }
+        let (pad, color) = if reason <= 8 { (reason - 1, RED) } else { (reason - 9, AMBER) };
+        write_volatile(output.add(ROW4 + pad as usize), color);
+    } else if phase == AS_IDLE && showing_result && result == AS_RESULT_DONE {
+        // Seconds trimmed from the run (one channel), binary on pads 1-7
+        // (pad 1 = 1 s); pad 8 amber marks the readout.
+        let seconds = (as_u32(AS_TRIM_TOTAL) / AS_FRAMES_PER_SECOND).min(127);
+        let mut pad = 0;
+        while pad < 7 {
+            let lit = seconds & (1 << pad) != 0;
+            write_volatile(output.add(ROW4 + pad), if lit { GREEN } else { 0 });
+            pad += 1;
+        }
+        write_volatile(output.add(ROW4 + 7), AMBER);
+    }
+}
+
+/// Stops a take (as the Record button would) before the DSP runs out of
+/// sample memory. Out of pages, the DSP abandons the take on discard slot
+/// 127 while stock keeps "recording" nothing, and a pair's right slot is
+/// never finalized. Returns true on the tick it stops a take, so nothing else
+/// presses Record before the state follows.
+#[cfg(keygroup_poc)]
+unsafe fn autosampler_memory_guard(objects: &AutoSampler) -> bool {
+    if objects.rec_state() != 3 {
+        as_set_u8(AS_GUARD_FIRED, 0);
+        return false;
+    }
+    if as_u8(AS_GUARD_FIRED) != 0 || as_elapsed(AS_GUARD_TIME) < AS_GUARD_READ_MS {
+        return false;
+    }
+    as_stamp(AS_GUARD_TIME);
+    if as_free_pages() >= AS_GUARD_PAGES {
+        return false;
+    }
+    objects.toggle();
+    as_set_u8(AS_GUARD_FIRED, 1);
+    as_alert();
+    true
+}
+
+/// Record button press (pointer at `0x08067CB4`, stock `0x08050250`). When
+/// stock would start a sample take (Shift observable `+0x18` clear, and mode
+/// observable `+0x2c` = 4 or `FUN_08059b28`) with the selected slot ready to
+/// record (view rec state 1),
+/// a start is refused, and rows 3-4 flash red, unless sample memory holds
+/// at least 1 s per channel beyond the guard margin.
+#[cfg(keygroup_poc)]
+#[no_mangle]
+pub unsafe extern "C" fn sample_rec_record_press(button: *mut u8, key: u32, a: u32, b: u32) -> u64 {
+    const STOCK_PRESS: usize = 0x0805_0251;
+    const RECORD: u32 = 0x10;
+    const SHIFT: usize = 0x18;
+    const MODE: usize = 0x2c;
+    const SAMPLE_REC_MODE: u8 = 4;
+
+    let stock = function::<unsafe extern "C" fn(*mut u8, u32, u32, u32) -> u64>(STOCK_PRESS);
+    if key != RECORD || button.is_null() || !autosampler_ready() {
+        return stock(button, key, a, b);
+    }
+    let observed = |offset: usize| {
+        let value = function::<ObservableValue>(0x0803_fc59)(read_u32(button, offset), 0);
+        if value.is_null() { 0xff } else { read_volatile(value) }
+    };
+    // Stock's own test for a sample take (0x080502EA): mode 4, or
+    // FUN_08059b28 (observable +0x20 is 2 or 3).
+    const SAMPLE_PATH: usize = 0x0805_9b29;
+    let sample_path = observed(MODE) == SAMPLE_REC_MODE
+        || function::<unsafe extern "C" fn(*mut u8) -> u32>(SAMPLE_PATH)(button) != 0;
+    if observed(SHIFT) != 0 || !sample_path {
+        return stock(button, key, a, b);
+    }
+    let Some(objects) = autosampler_objects() else {
+        return stock(button, key, a, b);
+    };
+    if objects.rec_state() != 1 {
+        return stock(button, key, a, b);
+    }
+    let channels = if as_pair_armed(objects.view) { 2 } else { 1 };
+    if as_free_pages() < AS_GUARD_PAGES + AS_START_PAGES_PER_CHANNEL * channels {
+        as_alert();
+        return 0;
+    }
+    stock(button, key, a, b)
+}
+
+#[cfg(keygroup_poc)]
+unsafe fn service_autosampler() {
+    if !autosampler_ready() {
+        return;
+    }
+    let objects = autosampler_objects();
+    autosampler_park_guard(objects.is_some());
+    let Some(objects) = objects else {
+        return;
+    };
+    if autosampler_memory_guard(&objects) {
+        return;
+    }
+    if as_u8(AS_REQUEST) != 0 {
+        as_set_u8(AS_REQUEST, 0);
+        if as_u8(AS_PHASE) == AS_IDLE {
+            let reason = autosampler_start(&objects);
+            if reason != 0 {
+                autosampler_fail(reason);
+            }
+        } else {
+            autosampler_abort(&objects);
+        }
+    }
+    if as_u8(AS_PHASE) != AS_IDLE {
+        autosampler_step(&objects);
+    }
+}
+
 #[cfg(paired_playback_poc)]
 #[no_mangle]
 pub unsafe extern "C" fn paired_playback_note_on(
@@ -1239,6 +3352,12 @@ pub unsafe extern "C" fn paired_playback_note_on(
     }
 
     if paired_follower_track(track) {
+        return;
+    }
+    #[cfg(keygroup_poc)]
+    let note = keygroup_note_on_hook(track, note);
+    #[cfg(keygroup_poc)]
+    if note == KG_DROP_NOTE {
         return;
     }
     let pair = playback_pair_index(track);
@@ -1522,6 +3641,8 @@ pub unsafe extern "C" fn stereo_position_dsp_update(
     const PAN_PARAMETER: u32 = 17;
 
     let stock = function::<TrackParameterDspUpdate>(STOCK_DSP_UPDATE);
+    #[cfg(keygroup_poc)]
+    let value = keygroup_flush_value(track_index, parameter, value);
     if parameter == PAN_PARAMETER && track_index < 8 {
         // Only the leader's own pan is narrowed to the left half of the field;
         // the follower is driven explicitly by `stereo_position_observable_set`.
@@ -2701,6 +4822,10 @@ pub unsafe extern "C" fn pair_color_boot_main() -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn pair_color_main_task(argument: *mut u8) {
     pair_color_table_init();
+    #[cfg(keygroup_poc)]
+    keygroup_init();
+    #[cfg(keygroup_poc)]
+    autosampler_init();
     function::<unsafe extern "C" fn(*mut u8)>(0x0802_5771)(argument)
 }
 
@@ -2905,6 +5030,15 @@ unsafe fn sample_bank_overlay(group: *const u8) {
     let base = read_volatile(bank.add(COLOR_BASE) as *const u16) as usize;
     let stock_selected = read_volatile(table.add(base + 1));
     let stock_dim = read_volatile(table.add(base + 2));
+    #[cfg(keygroup_poc)]
+    let series_whole =
+        !keygroup_track_disabled(paired_track_leader_index(track).unwrap_or(track));
+    #[cfg(keygroup_poc)]
+    let series_owned = |color: u16| -> bool {
+        matches!(color, SERIES_TAN | SERIES_DIM_TAN | SERIES_SKY | SERIES_DIM_SKY)
+    };
+    #[cfg(not(keygroup_poc))]
+    let series_owned = |_: u16| -> bool { false };
     let mut occupied_word = 0u32;
     let mut cell = 0u32;
     while cell < 32 {
@@ -2920,12 +5054,22 @@ unsafe fn sample_bank_overlay(group: *const u8) {
         let current = read_volatile(slot);
         cell += 1;
         if !matches!(current, OFF | WHITE | DIM_WHITE | TEAL | DIM_TEAL | DIM_RED)
+            && !series_owned(current)
             && current != stock_selected
             && current != stock_dim
         {
             continue;
         }
         let occupied = occupied_word >> (sample & 31) & 1 != 0;
+        #[cfg(keygroup_poc)]
+        if occupied {
+            if let Some(color) = keygroup_series_color(sample as u8, selected, series_whole) {
+                if current != color {
+                    write_volatile(slot, color);
+                }
+                continue;
+            }
+        }
         let stereo = occupied && pair_left(sample).is_some();
         let lit = sample == bright_low || sample == bright_high;
         let desired = match (lit, occupied, stereo) {
@@ -2951,7 +5095,11 @@ pub unsafe extern "C" fn sample_bank_compose(group: *mut u8, a: u32, b: u32, c: 
     if !group.is_null() && read_u32(group, 0) == PAGE_GROUP_VTABLE {
         sample_bank_overlay(group);
     }
-    function::<unsafe extern "C" fn(*mut u8, u32, u32, u32) -> u64>(0x0804_dd1d)(group, a, b, c)
+    let result =
+        function::<unsafe extern "C" fn(*mut u8, u32, u32, u32) -> u64>(0x0804_dd1d)(group, a, b, c);
+    #[cfg(keygroup_poc)]
+    keygroup_sample_mode_light(group, result as u32 as *mut u16);
+    result
 }
 
 /// Wraps the layer's observer handler (primary vtable slot `0x08067218`),
@@ -3565,6 +5713,8 @@ pub unsafe extern "C" fn paired_playback_note_off(
     if paired_follower_track(track) {
         return;
     }
+    #[cfg(keygroup_poc)]
+    let note = keygroup_note_off(track, note);
     stock(receiver, track, note);
     let Some(pair) = playback_pair_index(track) else {
         return
@@ -3675,6 +5825,14 @@ sample_pair_view_init_epilogue:
     .thumb_func
 sample_pair_press:
     push {{r0-r6, lr}}
+    bl autosampler_pad_press
+    cbz r0, .Lsample_pair_press_not_auto
+    ldr r0, [sp, #12]
+    movs r1, #0
+    add sp, #16
+    pop {{r4-r6, pc}}
+.Lsample_pair_press_not_auto:
+    ldmia sp, {{r0-r3}}
     bl sample_pair_clear_canonical_pad
     str r0, [sp, #4]
     ldr r0, [sp]
@@ -4231,6 +6389,8 @@ unsafe extern "C" fn sample_pair_led_overlay(view: *mut u8, output: *mut u16) {
     if view.is_null() {
         return;
     }
+    #[cfg(keygroup_poc)]
+    autosampler_overlay(view, output);
 
     // Runtime identity probe for the Sample view's encoder delegate.
     //
@@ -5057,6 +7217,29 @@ unsafe extern "C" fn sample_pair_led_overlay(view: *mut u8, output: *mut u16) {
         // the save, so the flash was removed at the user's request.
     }
 
+    #[cfg(all(keygroup_poc, sample_pair_identity_poc, sample_pair_writer_coupling_poc))]
+    {
+        let page_base = read_u8(view, PAGE) * 16;
+        let mut pad = 0u8;
+        while pad < 16 {
+            let slot = page_base + pad;
+            pad += 1;
+            if !sample_view_slot_occupied(view, slot) {
+                continue;
+            }
+            let Some((begin, end, _)) = keygroup_series(slot) else {
+                continue;
+            };
+            let holds_selected = selected_slot >= begin && selected_slot <= end;
+            if clear_active && !holds_selected {
+                continue;
+            }
+            if let Some(color) = keygroup_series_color(slot, selected_slot as u32, true) {
+                write_volatile(colors.add((pad - 1) as usize), color);
+            }
+        }
+    }
+
     #[cfg(sample_pair_gesture_poc)]
     if let Some(left_pad) = armed_pad {
         // While a stereo capture is saving, the pair is already shown filled in
@@ -5129,27 +7312,6 @@ unsafe extern "C" fn sample_pair_led_overlay(view: *mut u8, output: *mut u16) {
                 }
             }
 
-        }
-    }
-
-    #[cfg(all(paired_playback_poc, not(pan_parameter_probe)))]
-    if read_u8(view, PAGE) == PAGE_8 {
-        if let Some((leader_slot, follower_slot, enabled)) =
-            paired_playback_assignment(PLAYBACK_LEADER_TRACK)
-        {
-            let mut bit = 0;
-            while bit < 7 {
-                if leader_slot & (1 << bit) != 0 {
-                    write_volatile(colors.add(bit), SAVING_COLOR);
-                }
-                if follower_slot & (1 << bit) != 0 {
-                    write_volatile(colors.add(8 + bit), SAVING_COLOR);
-                }
-                bit += 1;
-            }
-            if enabled {
-                write_volatile(colors.add(7), SAVING_COLOR);
-            }
         }
     }
 
@@ -5540,6 +7702,10 @@ pub unsafe extern "C" fn stereo_main_loop_tick() {
     service_pair_selection();
     #[cfg(stereo_position_poc)]
     service_occupancy_model_cache();
+    #[cfg(keygroup_poc)]
+    service_keygroup_image();
+    #[cfg(keygroup_poc)]
+    service_autosampler();
     #[cfg(not(stereo_stock_save_queue))]
     service_deferred_stereo_refresh();
     #[cfg(all(sample_pair_identity_poc, native_dual_capture_poc))]
@@ -5792,6 +7958,29 @@ unsafe fn stereo_carry_displaced_latch(state: *mut u8, replacement: u32) {
         live -= 1;
     }
     write_u32(state, STATE_SAVE_PAIR_CARRY + live * 4, existing);
+}
+
+/// Drops carried pairs that cover any of `first..=last`, the slots a new
+/// capture is starting in. Only an empty slot can be recorded, so a pair
+/// still carried there was abandoned (its take never saved) and must not
+/// stamp the new take as one of its halves.
+#[cfg(native_dual_capture_poc)]
+unsafe fn stereo_carry_forget_slots(state: *mut u8, first: u8, last: u8) {
+    if state.is_null() {
+        return;
+    }
+    let mut index = 0;
+    while index < STEREO_CARRY_SLOTS {
+        let entry = read_u32(state, STATE_SAVE_PAIR_CARRY + index * 4);
+        let left = entry as u8;
+        if entry & ARM_TOKEN_MAGIC_MASK == ARM_TOKEN_MAGIC
+            && left <= last
+            && left.wrapping_add(1) >= first
+        {
+            write_u32(state, STATE_SAVE_PAIR_CARRY + index * 4, 0);
+        }
+        index += 1;
+    }
 }
 
 /// Replaces the sample-occupancy model's *observer* vtable slot (`0x08067588`)
@@ -6099,6 +8288,18 @@ pub unsafe extern "C" fn stereo_stock_header_write(
                     WAV_BYTE_RATE_STEREO_RIGHT
                 },
             );
+        }
+        // A rewrite (e.g. a crop) of a set member must keep its root tag.
+        #[cfg(keygroup_poc)]
+        {
+            let tag = keygroup_header_tag(read_u8(descriptor, DESCRIPTOR_PACK) & 0x1f, slot);
+            if tag != 0 {
+                write_u32(
+                    buffer.cast::<u8>(),
+                    WAV_BYTE_RATE_OFFSET,
+                    KG_BYTE_RATE_BASE + 4 * tag + side,
+                );
+            }
         }
     }
     function::<AsyncWrite>(ASYNC_WRITE)(
@@ -6915,6 +9116,8 @@ unsafe extern "C" fn sample_pair_gesture_release_after_stock(
     pad: u32,
 ) {
     if pad >= 16 || !sample_view_extension_valid(view) {
+        #[cfg(keygroup_poc)]
+        autosampler_pad_release(pad);
         return;
     }
     let held = read_u16(view, SAMPLE_VIEW_HELD_MASK) & !(1u16 << pad);
@@ -7211,6 +9414,8 @@ unsafe fn registry_set_pair(state: *mut u8, pack: u8, slot: u8) -> bool {
 
 #[cfg(sample_pair_identity_poc)]
 unsafe fn registry_clear_slot(state: *mut u8, pack: u8, slot: u8) {
+    #[cfg(keygroup_poc)]
+    keygroup_forget_slot(state, pack, slot);
     let Some((bank, inactive)) = registry_begin_delta(state, pack) else {
         return;
     };
@@ -7345,10 +9550,21 @@ unsafe extern "C" fn sample_pair_note_wav_header(header: *const u8, slot: u32) {
     // attributed to an unstamped header rather than to the pairing logic.
     #[cfg(all(native_dual_capture_poc, crop_io_trace))]
     let _ = byte_rate;
-    if byte_rate == WAV_BYTE_RATE_STEREO_LEFT && is_stereo_pair_start(slot) {
+    #[cfg(keygroup_poc)]
+    let (stereo_left, stereo_right) = {
+        let (role, tag) = keygroup_decode_byte_rate(byte_rate);
+        keygroup_roots_note(slot, tag);
+        (role == 1, role == 2)
+    };
+    #[cfg(not(keygroup_poc))]
+    let (stereo_left, stereo_right) = (
+        byte_rate == WAV_BYTE_RATE_STEREO_LEFT,
+        byte_rate == WAV_BYTE_RATE_STEREO_RIGHT,
+    );
+    if stereo_left && is_stereo_pair_start(slot) {
         write_u8(state, STATE_SCAN_PENDING_LEFT, slot);
     } else {
-        if byte_rate == WAV_BYTE_RATE_STEREO_RIGHT
+        if stereo_right
             && slot > 0
             && read_u8(state, STATE_SCAN_PENDING_LEFT) == slot - 1
         {
@@ -7390,6 +9606,8 @@ unsafe fn run_pair_full_scan(
     write_u8(state, STATE_SCAN_PENDING_LEFT, 0xff);
     let epoch = read_u32(state, STATE_MUTATION_EPOCH);
     write_u32(state, STATE_SCAN_EPOCH, epoch);
+    #[cfg(keygroup_poc)]
+    keygroup_roots_begin_scan();
 
     let result = function::<PackLoad>(stock_load)(argument);
     let failed = if success_is_zero {
@@ -7397,6 +9615,10 @@ unsafe fn run_pair_full_scan(
     } else {
         result == 0
     };
+    #[cfg(keygroup_poc)]
+    if !failed && argument < 0x20 {
+        keygroup_roots_end_scan(argument as u8);
+    }
     if !failed && read_u32(state, STATE_MUTATION_EPOCH) == epoch {
         // Bind the pack from the load argument, which is authoritative here.
         // The previous source - byte 0 of the active content store - is the
@@ -7630,6 +9852,7 @@ pub unsafe extern "C" fn native_capture_source_start(
     if token.is_none() {
         if !state.is_null() {
             stereo_carry_displaced_latch(state, 0);
+            stereo_carry_forget_slots(state, slot as u8, slot as u8);
             write_u32(state, STATE_CAPTURE_UI_TOKEN, 0);
             write_u32(state, STATE_SAVE_PAIR_LATCH, 0);
             write_u32(state, STATE_SAVE_VIEW_LATCH, 0);
@@ -7699,6 +9922,7 @@ pub unsafe extern "C" fn native_capture_source_start(
     // The gesture-owned token and view pointer are cleared by the next pad
     // press, which routinely lands before the right slot's Save completion.
     stereo_carry_displaced_latch(state, encode_arm_token(pack, left));
+    stereo_carry_forget_slots(state, left, left + 1);
     write_u32(state, STATE_SAVE_PAIR_LATCH, encode_arm_token(pack, left));
     write_u32(
         state,
@@ -8205,6 +10429,68 @@ unsafe fn finish_peer_clear(state: *mut u8) {
     write_u32(state, STATE_PEER_CLEAR_UI, 0);
 }
 
+/// Clear on any member of an auto-captured series clears the whole series.
+///
+/// The pressed slot (and its pair partner) go through the ordinary
+/// transactions. The rest are queued here and fed one at a time through the
+/// deferred peer Clear by `series_clear_advance`, so each is its own stock
+/// transaction issued from the main loop after the previous one has settled,
+/// exactly like a pair's peer. The series' tags are dropped at once, so the
+/// replayed requests are plain Clears and do not re-arm a series. A Clear
+/// while another series is still being cleared is left a plain Clear.
+#[cfg(all(keygroup_poc, sample_pair_identity_poc, native_dual_capture_poc))]
+unsafe fn series_clear_arm(completion: *mut u8, pack: u8, slot: u8) {
+    const COMPLETION_OFFSET: usize = 0x0c;
+
+    if completion.is_null()
+        || !autosampler_ready()
+        || as_u8(AS_SERIES_ACTIVE) != 0
+        || keygroup_roots_pack() != pack
+    {
+        return;
+    }
+    let Some((begin, end, _)) = keygroup_series(slot) else {
+        return;
+    };
+    let mut member = begin as usize;
+    while member <= end as usize {
+        write_volatile(KG_ROOTS.add(KG_ROOTS_TABLE + member), KG_ROOT_NONE);
+        member += 1;
+    }
+    as_set_u32(AS_SERIES_UI, (completion as usize - COMPLETION_OFFSET) as u32);
+    as_set_u8(AS_SERIES_NEXT, begin);
+    as_set_u8(AS_SERIES_END, end);
+    as_set_u8(AS_SERIES_SKIP, slot);
+    as_set_u8(AS_SERIES_ACTIVE, 1);
+}
+
+/// With no peer Clear outstanding, hands the next still-occupied member of the
+/// series being cleared to the deferred peer Clear, or retires the series.
+/// Each member is handed over once; the peer Clear's own retries cover it.
+#[cfg(all(keygroup_poc, sample_pair_identity_poc, native_dual_capture_poc))]
+unsafe fn series_clear_advance(state: *mut u8) {
+    if !autosampler_ready() || as_u8(AS_SERIES_ACTIVE) == 0 {
+        return;
+    }
+    let ui = as_u32(AS_SERIES_UI) as *mut u8;
+    let end = as_u8(AS_SERIES_END);
+    let skip = as_u8(AS_SERIES_SKIP);
+    let mut slot = as_u8(AS_SERIES_NEXT);
+    while !ui.is_null() && slot <= end && slot < 128 {
+        if slot != skip && sample_slot_occupied(ui, slot) {
+            as_set_u8(AS_SERIES_NEXT, slot + 1);
+            write_u32(state, STATE_PEER_CLEAR_UI, ui as u32);
+            write_u8(state, STATE_PEER_CLEAR_SLOT, slot);
+            write_u8(state, STATE_PEER_CLEAR_ATTEMPTS, 0);
+            write_u16(state, STATE_PEER_CLEAR_TICKS, 0);
+            write_u16(state, STATE_PEER_CLEAR_BUSY_TICKS, 0);
+            return;
+        }
+        slot += 1;
+    }
+    as_set_u8(AS_SERIES_ACTIVE, 0);
+}
+
 /// Releases a Sample Clear transaction that can never complete.
 ///
 /// Mirrors the tail of `SampleClear_OnComplete` exactly -- take the write-side
@@ -8309,6 +10595,8 @@ unsafe fn service_pending_peer_clear() {
     }
     let peer = read_u8(state, STATE_PEER_CLEAR_SLOT);
     if peer == PEER_CLEAR_NONE {
+        #[cfg(keygroup_poc)]
+        series_clear_advance(state);
         return;
     }
     let ui = read_u32(state, STATE_PEER_CLEAR_UI) as *mut u8;
@@ -8413,6 +10701,10 @@ pub unsafe extern "C" fn sample_pair_clear_request(
     let Some(left) = pair_left else {
         clear_witness(state, 4);
         pair_lookup_witness(state, pack, slot);
+        #[cfg(keygroup_poc)]
+        series_clear_arm(completion, pack, slot);
+        #[cfg(keygroup_poc)]
+        keygroup_forget_slot(state, pack, slot);
         function::<StockClearCoordinator>(STOCK_CLEAR_COORDINATOR)(
             coordinator,
             descriptor,
@@ -8429,6 +10721,8 @@ pub unsafe extern "C" fn sample_pair_clear_request(
     // member by `sample_pair_clear_canonical_pad`, so the stock transaction
     // below deletes whichever member was addressed; arm the other one to be
     // deleted by an independent, equally stock transaction from the main loop.
+    #[cfg(keygroup_poc)]
+    series_clear_arm(completion, pack, slot);
     arm_peer_clear(state, completion, left, slot);
     clear_witness(state, 6);
     if read_u8(state, STATE_PEER_CLEAR_SLOT) != PEER_CLEAR_NONE {

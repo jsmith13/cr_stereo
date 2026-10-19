@@ -25,10 +25,10 @@ SECTOR_6_START = 0x08080000
 # 380,326 bytes was rejected and candidate 5 at 380,328 bytes was accepted, the
 # two differing only by tail padding that made the image word aligned. The real
 # invariant is the four-byte alignment enforced above. The largest image the
-# bootloader has actually accepted is 381,460 bytes, so that is the proven
-# ceiling. A rejected image is harmless - the bootloader refuses it and the
+# bootloader has actually accepted is 391,436 bytes (series-b), so that is the
+# proven ceiling. A rejected image is harmless - the bootloader refuses it and the
 # unit keeps its current firmware.
-PROVEN_NATIVE_BOOTLOADER_MAX_IMAGE_SIZE = 381460
+PROVEN_NATIVE_BOOTLOADER_MAX_IMAGE_SIZE = 391436
 STOCK_APPLICATION_BUILD = 5706
 BUILD_NUMBER_ADDRESS = 0x080101CA
 BUILD_STRING_ADDRESSES = (0x080101D9, 0x08025A5B)
@@ -162,6 +162,16 @@ PAIR_COLOR_POINTER_HOOK = {
     0x08067228: ("pair_track_buttons_notify_thunk", bytes.fromhex("ddc20408")),
     # Page group cell getter (FUN_0804DD1C): recolour the Sample page bank.
     0x080678F8: ("sample_bank_compose", bytes.fromhex("1ddd0408")),
+}
+# Key groups: the sample bank's press (FUN_0805C1AC, vtable 0x08068294 slot 0)
+# previews the pressed sample through the track's note-on; the wrapper marks
+# that note so it bypasses the zone map. Enabled by the payload's marker.
+KEYGROUP_MARKER = "keygroup_marker"
+KEYGROUP_POINTER_HOOK = {
+    0x08068294: ("keygroup_bank_press", bytes.fromhex("adc10508")),
+    0x080678DC: ("keygroup_group_press", bytes.fromhex("a1d70408")),
+    # Record button press (FUN_08050250): refuse a sample take with no memory.
+    0x08067CB4: ("sample_rec_record_press", bytes.fromhex("51020508")),
 }
 # Every stock literal naming the colour-enum table (or an entry inside it) is
 # redirected to the payload's RAM copy at the same offset.
@@ -811,7 +821,14 @@ def apply_patches(
         symbol_hooks.update(STEREO_STOCK_HEADER_CALL_HOOK)
         symbol_hooks.update(STEREO_STOCK_SOURCE_READ_VTABLE_HOOK)
         symbol_hooks.update(STEREO_STOCK_OCCUPANCY_VTABLE_HOOK)
+    keygroup_poc = find_map_symbol(payload_map, KEYGROUP_MARKER) is not None
+    if keygroup_poc:
+        if not stereo_position_poc:
+            raise ValueError("Key groups require stereo position")
+        symbol_hooks.update(KEYGROUP_POINTER_HOOK)
     symbols = parse_map_symbols(payload_map, symbol_hooks)
+    if keygroup_poc:
+        symbols[KEYGROUP_MARKER] = find_map_symbol(payload_map, KEYGROUP_MARKER)
     if sample_pair_gesture_poc:
         require_thumb_literal(
             payload,
@@ -1171,6 +1188,18 @@ def apply_patches(
                 struct.pack("<I", symbols[symbol] | 1),
                 f"Redirect task entry to {symbol}",
             )
+        if keygroup_poc:
+            for address, (symbol, expected) in KEYGROUP_POINTER_HOOK.items():
+                if stock.count(expected) != 1:
+                    raise ValueError(f"Pointer for {symbol} is not unique")
+                patch_bytes(
+                    image,
+                    changes,
+                    address,
+                    expected,
+                    struct.pack("<I", symbols[symbol] | 1),
+                    f"Redirect vtable slot to {symbol}",
+                )
         table_literals = []
         for offset in range(0, EXPECTED_SIZE, 4):
             value = struct.unpack_from("<I", stock, offset)[0]
@@ -1280,6 +1309,7 @@ def apply_patches(
         native_publish_slot_probe_diagnostic
     )
     manifest["stereo_stock_save_queue"] = stereo_stock_save_queue
+    manifest["keygroup_poc"] = keygroup_poc
     manifest["crop_io_trace"] = crop_io_trace
     manifest["crop_mirror_window"] = crop_mirror_window
     manifest["native_deferred_refresh_probe_diagnostic"] = (

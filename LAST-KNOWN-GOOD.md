@@ -1,12 +1,59 @@
 # LAST KNOWN GOOD
 
-Build: build\sample-bank-b
+Build: build\series-b (released as v0.2.0)
 Image: circuitrhythm-firmware-5706-stereo-poc.bin
-Size:  384796 bytes (largest image accepted so far)
-SHA-256: e5463e328811c577d5afa94dbb5b26b88381a386281fd81b4c7bef17a4e925b6
-Pinned: 2026-10-17 (hardware-confirmed by user)
+Size:  391436 bytes
+SHA-256: 8f0a427e17a7f274e8e07ed1ba1f78c5a367bc99cc03d2d97557a51542b53217
+Pinned: 2026-10-18 (hardware-confirmed by user)
 
-Confirmed working on hardware (new in this pin):
+Build command for this pin (the v0.1.0 command plus -KeygroupPoc):
+  pwsh tools\build_stereo_firmware.ps1 -OutputDirectory build\series-b `
+    -NativeDualCapturePoc -SafePairGuard -SamplePairLedPoc -SamplePairIdentityPoc `
+    -SamplePairGesturePoc -SamplePairWriterCouplingPoc -SampleCacheRefreshPoc `
+    -PairedPlaybackPoc -StereoPositionPoc -StereoStockSaveQueue -CropMirrorWindow `
+    -KeygroupPoc
+
+Confirmed working on hardware (new since memfull-c):
+  * Auto-captured series: mono series tan, stereo series sky blue on the
+    Sample Rec page and the Sample page bank; selecting a member lights the
+    whole series; Clear on any member clears the whole series.
+  * Key-group pitch: unity is note 60 (key groups off, Note view C4 matches
+    the Sample Rec preview); every key now matches the sampled synth. The
+    earlier 84 was wrong. Pitch-shift noise far from a root (spacing 24) is
+    stock DSP resampling, not a payload defect.
+  * Memory gauge (pad 22 hold) and the old page-8 green paired-playback
+    diagnostic removed.
+
+Previous pin: build\memfull-c (390920 B, SHA-256
+afddd6da4b22415c9e3971f55bde2e0b237a024cdc2b0dc3497d9f8beedfa2a2).
+
+Confirmed working on hardware (carried from memfull-c; new since
+sample-bank-b; details and evidence in reverse-engineering-log.md):
+  * Key groups: tagged sample sets play across the keys (nearest root);
+    tags live in the WAV byte-rate field and survive reboot;
+    Sample Mode pad 2 switches a track's key group off (saved per project).
+  * Auto-sampler (Sample Rec row-3 pad 8): drives an external synth over MIDI,
+    one slot per note, mono or stereo; trims silence before the first save,
+    and records the next take while the previous one saves.
+  * Auto-sampler settings: row-3 pad 6 + row 4 picks the semitone step; pad 7
+    toggles a 1 s / 4 s hold.
+  * Stereo DSP writer bounds: the writer stops at the stock discard slot $7F,
+    not $80. Before this, a failed paired allocation left it writing past the
+    page tables, which hung saves once memory was full. Clear does return
+    pages to the DSP free ring (y:$371d1), confirmed with the memory gauge.
+  * Sample memory: Record is refused (rows 3-4 flash red) with under ~1 s
+    per channel free; a take stops itself 16 pages before memory runs out;
+    the auto-sampler refuses runs that will not fit (amber row-4 pad 4).
+  * Stereo with memory well used: the pair allocator rejected every page
+    >= $800 (sign-extended tst); fixed. Abandoned pairs no longer link the
+    next take into their slots (stereo_carry_forget_slots).
+
+Previous pin: build\memgauge-a (390368 B, SHA-256
+73a1d048dc063611dfab18abcb4944b8ae858d7a052a28c0dcc9c4298db05ee2), and before
+it build\sample-bank-b (384796 B, SHA-256
+e5463e328811c577d5afa94dbb5b26b88381a386281fd81b4c7bef17a4e925b6; v0.1.0).
+
+Confirmed working on hardware (carried from sample-bank-b):
   * Sample bank colours on the track Sample page (bottom two rows): empty off,
     mono dim white, stereo half dim teal; selected slot bright white / teal,
     selected empty dim red; a paired track lights both halves. Page group

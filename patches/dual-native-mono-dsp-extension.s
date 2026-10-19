@@ -140,8 +140,10 @@ org p:$0dc9
 capture_writer_entry:
         move y:$371d4,a
         brclr #2,a1,writer_mono
+        ; Stock parks a failed allocation on discard slot $7f; a pair there
+        ; would resolve slot $80 past the page tables, so stop at $7f.
         move y:$371d5,a
-        cmp #$000080,a
+        cmp #$00007f,a
         bge writer_done
 
         move y:$371d7,a
@@ -150,7 +152,7 @@ capture_writer_entry:
         bne writer_pages_ready
         jsr >capture_allocator_entry
         move y:$371d5,a
-        cmp #$000080,a
+        cmp #$00007f,a
         bge writer_done
 writer_pages_ready:
         ; Left destination uses the stock current-page base.
@@ -248,8 +250,9 @@ capture_allocator_entry:
         tst a
         beq allocator_fail
         move a1,b
+        ; AND sets Z from b1 only; tst would also see b2, which is all
+        ; ones for pages >= $800 (page<<12 has bit 23 set).
         and #$000fff,b
-        tst b
         bne allocator_fail
         move y:$371cf,a
         add #>$000001,a
@@ -262,8 +265,9 @@ capture_allocator_entry:
         tst a
         beq allocator_fail
         move a1,b
+        ; AND sets Z from b1 only; tst would also see b2, which is all
+        ; ones for pages >= $800 (page<<12 has bit 23 set).
         and #$000fff,b
-        tst b
         bne allocator_fail
 
         ; Sequential stock pops are atomic after complete prevalidation.

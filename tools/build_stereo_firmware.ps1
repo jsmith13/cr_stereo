@@ -83,6 +83,8 @@ param(
     [switch]$CropExtentProbe,
     [switch]$CropIoTrace,
     [switch]$CropMirrorWindow,
+    [switch]$KeygroupPoc,
+    [switch]$KeygroupSeed,
 
     [switch]$NativeWriterReadinessProbeDiagnostic,
 
@@ -215,6 +217,8 @@ if ($NativeDualCapturePoc) {
     -CropExtentProbe:$CropExtentProbe `
     -CropIoTrace:$CropIoTrace `
     -CropMirrorWindow:$CropMirrorWindow `
+    -KeygroupPoc:$KeygroupPoc `
+    -KeygroupSeed:$KeygroupSeed `
     -NativeWriterReadinessProbeDiagnostic:$NativeWriterReadinessProbeDiagnostic `
     -NativeWriterAcquisitionProbeDiagnostic:$NativeWriterAcquisitionProbeDiagnostic `
     -NativeArmTokenProbeDiagnostic:$NativeArmTokenProbeDiagnostic `
