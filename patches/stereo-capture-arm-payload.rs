@@ -1757,6 +1757,10 @@ unsafe fn keygroup_set_voices(index: u32, leader: u8, follower: Option<u8>) {
 #[inline(never)]
 extern "C" fn keygroup_note_on_hook(track: u32, note: u32) -> u32 {
     unsafe {
+        #[cfg(granular_looper)]
+        if looper_owns_track(track) {
+            return KG_DROP_NOTE;
+        }
         let paired = playback_pair_index(track).is_some() && paired_pair_enabled(track);
         keygroup_note_on(track, note, paired).unwrap_or(KG_DROP_NOTE)
     }
@@ -1840,6 +1844,11 @@ extern "C" fn keygroup_note_off(track: u32, note: u32) -> u32 {
 
 #[cfg(keygroup_poc)]
 unsafe fn keygroup_note_off_inner(track: u32, note: u32) -> u32 {
+    #[cfg(granular_looper)]
+    if looper_owns_track(track) {
+        looper_note(track, note, 0, 0);
+        return KG_NO_NOTE;
+    }
     if !keygroup_ready() {
         return note;
     }
@@ -1867,6 +1876,8 @@ extern "C" fn keygroup_flush_value(voice: u32, parameter: u32, value: u32) -> u3
 
 #[cfg(keygroup_poc)]
 unsafe fn keygroup_flush_value_inner(voice: u32, parameter: u32, value: u32) -> u32 {
+    #[cfg(granular_looper)]
+    let value = looper_flush_value(voice, parameter, value);
     if parameter != 0 || voice >= 8 || !keygroup_ready() {
         return value;
     }
@@ -3354,6 +3365,8 @@ pub unsafe extern "C" fn paired_playback_note_on(
     if paired_follower_track(track) {
         return;
     }
+    #[cfg(granular_looper)]
+    looper_note(track, note, velocity, 1);
     #[cfg(keygroup_poc)]
     let note = keygroup_note_on_hook(track, note);
     #[cfg(keygroup_poc)]
@@ -4231,6 +4244,10 @@ pub unsafe extern "C" fn track_pair_button_press(
     const TRACK_BUTTONS_BLOCKED: usize = 0x0c;
 
     let stock = function::<SidechainPadInput>(STOCK_ROOT_PRESS);
+    #[cfg(emitter)]
+    if let Some(result) = emitter_button(root, button, context) {
+        return result;
+    }
     if root.is_null() || button >= 8 {
         return stock(root, button, event, context);
     }
@@ -4826,6 +4843,8 @@ pub unsafe extern "C" fn pair_color_main_task(argument: *mut u8) {
     keygroup_init();
     #[cfg(keygroup_poc)]
     autosampler_init();
+    #[cfg(emitter)]
+    emitter_init();
     function::<unsafe extern "C" fn(*mut u8)>(0x0802_5771)(argument)
 }
 
@@ -5099,9 +5118,2160 @@ pub unsafe extern "C" fn sample_bank_compose(group: *mut u8, a: u32, b: u32, c: 
         function::<unsafe extern "C" fn(*mut u8, u32, u32, u32) -> u64>(0x0804_dd1d)(group, a, b, c);
     #[cfg(keygroup_poc)]
     keygroup_sample_mode_light(group, result as u32 as *mut u16);
+    #[cfg(emitter)]
+    emitter_paint(result as u32 as *mut u16);
     result
 }
 
+#[cfg(all(emitter, not(keygroup_poc)))]
+compile_error!("the emitter view requires keygroup_poc");
+
+#[cfg(all(granular_probe, granular_looper))]
+compile_error!("granular_probe and granular_looper are exclusive");
+
+/// Granular probe: a stub "emitter" overlay opened with Shift + Track, plus
+/// load telemetry for the ARM main loop and the DSP (core B).
+///
+/// The overlay rides the page group like the Sample Rec overlays: stock keeps
+/// its page, and while the overlay is active the payload consumes pads,
+/// encoders and pressure (new root vtable hooks) and repaints the 32 pads and
+/// 8 encoder LEDs. Arrows (`0x13`/`0x14`) step through five pages:
+///
+/// 0. grid: dim row stripes, held pads bright, last pad white;
+/// 1. inputs: last encoder, its |delta| (green +, red -), pressure (all dim red
+///    until an event arrives), velocity;
+/// 2. ARM: average and worst Main pass in µs, 16-bit binary (pad 0 = MSB);
+/// 3. DSP: average and minimum idle spins per block; encoder 8 adds a calibrated
+///    burn (red encoder bar) to measure headroom;
+/// 4. clocks: CPU MHz and DSP blocks per second.
+///
+/// Shift + the same track, or any other button except tracks, Record, Play and
+/// Shift, closes it (the closing press is swallowed). It also closes when the
+/// input lock engages or stock leaves the page group.
+#[cfg(granular_probe)]
+#[no_mangle]
+pub extern "C" fn granular_probe_marker() {}
+
+#[cfg(emitter)]
+const GP_STATE: *mut u8 = 0x2004_fd50 as *mut u8;
+#[cfg(emitter)]
+const GP_MAGIC: u32 = 0x4750_524f;
+#[cfg(emitter)]
+const GP_ACTIVE: usize = 4;
+#[cfg(emitter)]
+const GP_TRACK: usize = 5;
+#[cfg(granular_probe)]
+const GP_PAGE: usize = 6;
+#[cfg(emitter)]
+const GP_LAST_PAD: usize = 7;
+#[cfg(emitter)]
+const GP_HELD: usize = 8;
+#[cfg(emitter)]
+const GP_VELOCITY: usize = 12;
+#[cfg(granular_probe)]
+const GP_LAST_ENCODER: usize = 13;
+#[cfg(granular_probe)]
+const GP_BURN: usize = 14;
+#[cfg(granular_probe)]
+const GP_BURN_SENT: usize = 15;
+#[cfg(granular_probe)]
+const GP_LAST_DELTA: usize = 16;
+#[cfg(granular_probe)]
+const GP_PRESSURE: usize = 20;
+#[cfg(emitter)]
+const GP_VIEW: usize = 21;
+#[cfg(granular_probe)]
+const GP_PRESSURE_COUNT: usize = 22;
+#[cfg(granular_probe)]
+const GP_ENCODERS: usize = 24;
+#[cfg(granular_probe)]
+const GP_LAST_CYCLES: usize = 32;
+#[cfg(granular_probe)]
+const GP_WINDOW_CYCLES: usize = 36;
+#[cfg(granular_probe)]
+const GP_WINDOW_TICK: usize = 40;
+#[cfg(granular_probe)]
+const GP_PASSES: usize = 44;
+#[cfg(granular_probe)]
+const GP_MAX_CYCLES: usize = 48;
+#[cfg(granular_probe)]
+const GP_SUM_CYCLES: usize = 52;
+#[cfg(granular_probe)]
+const GP_AVG_US: usize = 56;
+#[cfg(granular_probe)]
+const GP_MAX_US: usize = 60;
+#[cfg(granular_probe)]
+const GP_MHZ: usize = 64;
+#[cfg(granular_probe)]
+const GP_DSP_AVG: usize = 68;
+#[cfg(granular_probe)]
+const GP_DSP_MIN: usize = 72;
+#[cfg(granular_probe)]
+const GP_DSP_RATE: usize = 76;
+#[cfg(granular_probe)]
+const GP_DSP_OK: usize = 80;
+#[cfg(granular_probe)]
+const GP_DSP_BLOCKS: usize = 84;
+#[cfg(granular_probe)]
+const GP_DSP_BLOCKS_TICK: usize = 88;
+#[cfg(granular_probe)]
+const GP_READ_TICK: usize = 92;
+#[cfg(granular_probe)]
+const GP_STATE_LEN: usize = 176;
+#[cfg(all(granular_probe, not(granular_retrigger)))]
+const GP_PAGES: u8 = 5;
+#[cfg(granular_retrigger)]
+const GP_PAGES: u8 = 7;
+#[cfg(emitter)]
+const GP_NO_PAD: u8 = 0xff;
+/// Core-B telemetry words (shared Y), see `patches/granular-probe-dsp.s`.
+#[cfg(granular_probe)]
+const GP_DSP_MIN_WORD: u32 = 0x0003_7f03;
+#[cfg(granular_probe)]
+const GP_DSP_SUM_WORD: u32 = 0x0003_7f05;
+#[cfg(granular_probe)]
+const GP_DSP_BLOCKS_WORD: u32 = 0x0003_7f06;
+#[cfg(granular_probe)]
+const GP_DSP_BURN_WORD: u32 = 0x0003_7f07;
+#[cfg(granular_probe)]
+const GP_DSP_MAGIC_WORD: u32 = 0x0003_7f08;
+#[cfg(granular_probe)]
+const GP_DSP_MAGIC: u32 = 0x0047_504b;
+/// Each burn level adds 2500 iterations of a 4-cycle loop per block.
+#[cfg(granular_probe)]
+const GP_BURN_STEP: u32 = 2500;
+#[cfg(granular_probe)]
+const GP_DSP_WINDOW_BLOCKS: u32 = 1024;
+
+#[cfg(emitter)]
+unsafe fn gp_u8(offset: usize) -> u8 {
+    read_volatile(GP_STATE.add(offset))
+}
+
+#[cfg(emitter)]
+unsafe fn gp_set_u8(offset: usize, value: u8) {
+    write_volatile(GP_STATE.add(offset), value);
+}
+
+#[cfg(emitter)]
+unsafe fn gp_u32(offset: usize) -> u32 {
+    read_volatile(GP_STATE.add(offset) as *const u32)
+}
+
+#[cfg(emitter)]
+unsafe fn gp_set_u32(offset: usize, value: u32) {
+    write_volatile(GP_STATE.add(offset) as *mut u32, value);
+}
+
+#[cfg(emitter)]
+fn gp_div(value: u32, divisor: u32) -> u32 {
+    value.checked_div(divisor).unwrap_or(0)
+}
+
+#[cfg(emitter)]
+unsafe fn gp_ready() -> bool {
+    gp_u32(0) == GP_MAGIC
+}
+
+#[cfg(emitter)]
+unsafe fn gp_active() -> bool {
+    gp_ready() && gp_u8(GP_ACTIVE) != 0
+}
+
+/// Clears the state and starts the Cortex-M7 cycle counter (DWT CYCCNT).
+#[cfg(granular_probe)]
+unsafe fn emitter_init() {
+    const DEMCR: *mut u32 = 0xe000_edfc as *mut u32;
+    const DWT_LAR: *mut u32 = 0xe000_1fb0 as *mut u32;
+    const DWT_CTRL: *mut u32 = 0xe000_1000 as *mut u32;
+
+    for offset in 0..GP_STATE_LEN {
+        write_volatile(GP_STATE.add(offset), 0);
+    }
+    gp_set_u8(GP_LAST_PAD, GP_NO_PAD);
+    gp_set_u8(GP_LAST_ENCODER, GP_NO_PAD);
+    write_volatile(DEMCR, read_volatile(DEMCR) | (1 << 24));
+    write_volatile(DWT_LAR, 0xc5ac_ce55);
+    write_volatile(DWT_CTRL, read_volatile(DWT_CTRL) | 1);
+    #[cfg(granular_retrigger)]
+    lab_init();
+    gp_set_u32(0, GP_MAGIC);
+}
+
+#[cfg(emitter)]
+unsafe fn gp_cycles() -> u32 {
+    read_volatile(0xe000_1004 as *const u32)
+}
+
+#[cfg(emitter)]
+unsafe fn gp_root() -> *mut u8 {
+    read_volatile((0x2000_6ea0 as *const u32).add(1)) as *mut u8
+}
+
+#[cfg(emitter)]
+unsafe fn gp_observable_byte(observable: u32) -> u8 {
+    if observable == 0 {
+        return 0;
+    }
+    let value = function::<ObservableValue>(0x0803_fc59)(observable, 0);
+    if value.is_null() { 0 } else { read_volatile(value) }
+}
+
+/// Stock's input lock (`+0x8C` bit 1): every root input method defers to it.
+#[cfg(emitter)]
+unsafe fn gp_locked(root: *const u8) -> bool {
+    gp_observable_byte(read_u32(root, 0x8c)) & 2 != 0
+}
+
+#[cfg(emitter)]
+unsafe fn gp_view(root: *const u8) -> u8 {
+    gp_observable_byte(read_u32(root, 0x14))
+}
+
+/// The overlay paints through the page group's compose, so it needs the page
+/// group to be the live child.
+#[cfg(emitter)]
+unsafe fn gp_can_show(root: *const u8) -> bool {
+    !gp_locked(root)
+        && gp_view(root) != 9
+        && read_u32(root, 0x7c) != 0
+        && read_u32(root, 0x7c) == read_u32(root, 0x3c)
+}
+
+/// Latching Shift (settings elem 2 bit 19) stays set after the gesture, so it
+/// is released here the way `FUN_0804B39A` releases a non-latching Shift.
+#[cfg(emitter)]
+unsafe fn gp_release_latched_shift(root: *const u8) {
+    const OBSERVABLE_VALUE: usize = 0x0803_fd27;
+    const OBSERVABLE_PUBLISH: usize = 0x0803_fbed;
+    let shift = read_u32(root, 0x10) as *const u8;
+    if shift.is_null() {
+        return;
+    }
+    let settings = read_u32(shift, 0x10);
+    if settings == 0 {
+        return;
+    }
+    let flags = function::<ObservableValue>(0x0803_fc59)(settings, 2);
+    if flags.is_null() || core::ptr::read_unaligned(flags as *const u32) & (1 << 19) == 0 {
+        return;
+    }
+    let observable = read_u32(shift, 0x0c);
+    if observable == 0 {
+        return;
+    }
+    let value = function::<ObservableValue>(OBSERVABLE_VALUE)(observable, 0);
+    if !value.is_null() {
+        write_volatile(value, 0);
+        function::<FirmwareMethod4>(OBSERVABLE_PUBLISH)(observable, 0, 0, 0);
+    }
+}
+
+#[cfg(emitter)]
+unsafe fn gp_open(root: *const u8, track: u32) {
+    gp_set_u8(GP_TRACK, track as u8);
+    gp_set_u8(GP_VIEW, gp_view(root));
+    gp_set_u32(GP_HELD, 0);
+    gp_set_u8(GP_LAST_PAD, GP_NO_PAD);
+    gp_set_u8(GP_ACTIVE, 1);
+}
+
+#[cfg(granular_probe)]
+unsafe fn gp_retarget(track: u32) {
+    if gp_u8(GP_TRACK) as u32 != track {
+        #[cfg(granular_retrigger)]
+        lab_stop();
+        gp_set_u8(GP_TRACK, track as u8);
+    }
+}
+
+#[cfg(granular_probe)]
+unsafe fn gp_close() {
+    #[cfg(granular_retrigger)]
+    lab_stop();
+    gp_set_u8(GP_ACTIVE, 0);
+    gp_set_u32(GP_HELD, 0);
+}
+
+/// Root button press, ahead of the pairing gesture. `Some` swallows the press.
+#[cfg(granular_probe)]
+unsafe fn emitter_button(root: *mut u8, button: u32, context: u32) -> Option<u32> {
+    const RECORD: u32 = 0x10;
+    const PLAY: u32 = 0x11;
+    const PREVIOUS: u32 = 0x13;
+    const NEXT: u32 = 0x14;
+    const SHIFT: u32 = 0x1b;
+
+    if root.is_null() || !gp_ready() {
+        return None;
+    }
+    let shift = gp_observable_byte(read_u32(root, 0x0c)) != 0;
+    if !gp_active() {
+        if button < 8 && shift && gp_can_show(root) {
+            gp_open(root, button);
+            gp_release_latched_shift(root);
+            return Some(context);
+        }
+        return None;
+    }
+    match button {
+        0..=7 if shift => {
+            if gp_u8(GP_TRACK) as u32 == button {
+                gp_close();
+            } else {
+                gp_retarget(button);
+            }
+            gp_release_latched_shift(root);
+            Some(context)
+        }
+        0..=7 => {
+            gp_retarget(button);
+            None
+        }
+        PREVIOUS | NEXT => {
+            let page = gp_u8(GP_PAGE);
+            let page = if button == NEXT {
+                (page + 1) % GP_PAGES
+            } else {
+                (page + GP_PAGES - 1) % GP_PAGES
+            };
+            gp_set_u8(GP_PAGE, page);
+            Some(context)
+        }
+        RECORD | PLAY | SHIFT => None,
+        _ => {
+            gp_close();
+            Some(context)
+        }
+    }
+}
+
+/// Root pad press (vtable slot `0x080672E4`, stock `0x0803D7FE`).
+#[cfg(granular_probe)]
+#[no_mangle]
+pub unsafe extern "C" fn emitter_pad_press(root: *mut u8, pad: u32, velocity: u32, context: u32) -> u32 {
+    if gp_active() && pad < 32 && !gp_locked(root) {
+        gp_set_u32(GP_HELD, gp_u32(GP_HELD) | (1 << pad));
+        gp_set_u8(GP_LAST_PAD, pad as u8);
+        gp_set_u8(GP_VELOCITY, velocity.min(127) as u8);
+        #[cfg(granular_retrigger)]
+        if gp_u8(GP_PAGE) == LAB_PAGE {
+            lab_pad(pad);
+        }
+        return context;
+    }
+    function::<SidechainPadInput>(0x0803_d7ff)(root, pad, velocity, context)
+}
+
+/// Root pad release (slot `0x080672E8`, stock `0x0803D896`). A pad held from
+/// before the overlay opened still has stock's held bit (`+0x9C`), so its
+/// release goes to stock and no note is left hanging.
+#[cfg(granular_probe)]
+#[no_mangle]
+pub unsafe extern "C" fn emitter_pad_release(root: *mut u8, pad: u32, a: u32, context: u32) -> u32 {
+    if gp_ready() && pad < 32 {
+        gp_set_u32(GP_HELD, gp_u32(GP_HELD) & !(1 << pad));
+        let stock_held = !root.is_null()
+            && read_u8(root, 0x9c + (pad as usize >> 3)) & (1 << (pad & 7)) != 0;
+        if gp_active() && !stock_held {
+            return context;
+        }
+    }
+    function::<SidechainPadInput>(0x0803_d897)(root, pad, a, context)
+}
+
+/// Root encoder turn (slot `0x080672F4`, stock `0x0803DDE0`): 8 macro encoders.
+#[cfg(granular_probe)]
+#[no_mangle]
+pub unsafe extern "C" fn emitter_encoder(root: *mut u8, encoder: u32, delta: i32, context: u32) -> u32 {
+    if gp_active() && encoder < 8 && !gp_locked(root) {
+        let slot = GP_ENCODERS + encoder as usize;
+        let value = (gp_u8(slot) as i32 + delta).clamp(0, 127);
+        gp_set_u8(slot, value as u8);
+        gp_set_u8(GP_LAST_ENCODER, encoder as u8);
+        gp_set_u32(GP_LAST_DELTA, delta as u32);
+        #[cfg(granular_retrigger)]
+        if gp_u8(GP_PAGE) == LAB_PAGE {
+            lab_encoder(encoder, delta);
+        }
+        if encoder == 7 {
+            gp_set_u8(GP_BURN, (value / 16) as u8);
+        }
+        return context;
+    }
+    function::<SidechainPadInput>(0x0803_dde1)(root, encoder, delta as u32, context)
+}
+
+/// Root pad pressure (slot `0x080672FC`, stock `0x0803DE0A`).
+#[cfg(granular_probe)]
+#[no_mangle]
+pub unsafe extern "C" fn emitter_pressure(root: *mut u8, pad: u32, value: u32, context: u32) -> u32 {
+    if gp_active() && !gp_locked(root) {
+        gp_set_u8(GP_PRESSURE, value.min(255) as u8);
+        let count = read_volatile(GP_STATE.add(GP_PRESSURE_COUNT) as *const u16);
+        write_volatile(GP_STATE.add(GP_PRESSURE_COUNT) as *mut u16, count.saturating_add(1));
+        let _ = pad;
+        return context;
+    }
+    function::<SidechainPadInput>(0x0803_de0b)(root, pad, value, context)
+}
+
+/// Main loop: pass timing, auto-exit, DSP telemetry and the burn level.
+#[cfg(granular_probe)]
+unsafe fn service_emitter() {
+    const DSP_READ: usize = 0x0803_14d7;
+    const DSP_WRITE: usize = 0x0803_1229;
+
+    if !gp_ready() {
+        return;
+    }
+    let now = gp_cycles();
+    let tick = read_volatile(HAL_TICK);
+    let last = gp_u32(GP_LAST_CYCLES);
+    if last != 0 {
+        let delta = now.wrapping_sub(last);
+        gp_set_u32(GP_SUM_CYCLES, gp_u32(GP_SUM_CYCLES).wrapping_add(delta));
+        gp_set_u32(GP_PASSES, gp_u32(GP_PASSES) + 1);
+        if delta > gp_u32(GP_MAX_CYCLES) {
+            gp_set_u32(GP_MAX_CYCLES, delta);
+        }
+    } else {
+        gp_set_u32(GP_WINDOW_CYCLES, now);
+        gp_set_u32(GP_WINDOW_TICK, tick);
+    }
+    gp_set_u32(GP_LAST_CYCLES, now);
+    let elapsed_ms = tick.wrapping_sub(gp_u32(GP_WINDOW_TICK));
+    if elapsed_ms >= 1000 {
+        let mhz = gp_div(now.wrapping_sub(gp_u32(GP_WINDOW_CYCLES)), elapsed_ms.saturating_mul(1000));
+        let passes = gp_u32(GP_PASSES);
+        if mhz != 0 && passes != 0 {
+            gp_set_u32(GP_MHZ, mhz);
+            gp_set_u32(GP_AVG_US, gp_div(gp_div(gp_u32(GP_SUM_CYCLES), passes), mhz));
+            gp_set_u32(GP_MAX_US, gp_div(gp_u32(GP_MAX_CYCLES), mhz));
+        }
+        gp_set_u32(GP_WINDOW_CYCLES, now);
+        gp_set_u32(GP_WINDOW_TICK, tick);
+        gp_set_u32(GP_PASSES, 0);
+        gp_set_u32(GP_SUM_CYCLES, 0);
+        gp_set_u32(GP_MAX_CYCLES, 0);
+    }
+
+    let root = gp_root();
+    if gp_active() && (root.is_null() || !gp_can_show(root) || gp_view(root) != gp_u8(GP_VIEW)) {
+        gp_close();
+    }
+    #[cfg(granular_retrigger)]
+    lab_service(tick);
+    let page = gp_u8(GP_PAGE);
+    let active = gp_active();
+    let burn = if active && page == 3 { gp_u8(GP_BURN) } else { 0 };
+    if burn != gp_u8(GP_BURN_SENT) {
+        function::<DspWrite>(DSP_WRITE)(0, (burn as u32 * GP_BURN_STEP) << 8, GP_DSP_BURN_WORD);
+        gp_set_u8(GP_BURN_SENT, burn);
+    }
+    if !active || page < 3 || tick.wrapping_sub(gp_u32(GP_READ_TICK)) < 250 {
+        return;
+    }
+    gp_set_u32(GP_READ_TICK, tick);
+    let read = function::<DspRead>(DSP_READ);
+    let magic = (read(0, GP_DSP_MAGIC_WORD) >> 8) & 0xff_ffff;
+    gp_set_u8(GP_DSP_OK, (magic == GP_DSP_MAGIC) as u8);
+    if magic != GP_DSP_MAGIC {
+        return;
+    }
+    gp_set_u32(GP_DSP_AVG, ((read(0, GP_DSP_SUM_WORD) >> 8) & 0xff_ffff) / GP_DSP_WINDOW_BLOCKS);
+    gp_set_u32(GP_DSP_MIN, (read(0, GP_DSP_MIN_WORD) >> 8) & 0xff_ffff);
+    let blocks = (read(0, GP_DSP_BLOCKS_WORD) >> 8) & 0xff_ffff;
+    let since = tick.wrapping_sub(gp_u32(GP_DSP_BLOCKS_TICK));
+    if gp_u32(GP_DSP_BLOCKS_TICK) != 0 && since != 0 {
+        let counted = blocks.wrapping_sub(gp_u32(GP_DSP_BLOCKS)) & 0xff_ffff;
+        gp_set_u32(GP_DSP_RATE, gp_div(counted * 1000, since));
+    }
+    gp_set_u32(GP_DSP_BLOCKS, blocks);
+    gp_set_u32(GP_DSP_BLOCKS_TICK, tick.max(1));
+}
+
+#[cfg(granular_probe)]
+unsafe fn gp_bar(pads: *mut u16, row: usize, length: u32, lit: u16, unlit: u16) {
+    for column in 0..8usize {
+        let color = if (column as u32) < length { lit } else { unlit };
+        write_volatile(pads.add(row * 8 + column), color);
+    }
+}
+
+/// Two rows of 16 bits, most significant bit first.
+#[cfg(granular_probe)]
+unsafe fn gp_binary(pads: *mut u16, first_row: usize, value: u32, lit: u16, unlit: u16) {
+    let value = value.min(0xffff);
+    for index in 0..16usize {
+        let bit = value & (1 << (15 - index)) != 0;
+        write_volatile(pads.add(first_row * 8 + index), if bit { lit } else { unlit });
+    }
+}
+
+/// Repaints the pads and encoder LEDs after stock's group compose.
+#[cfg(granular_probe)]
+unsafe fn emitter_paint(pads: *mut u16) {
+    const OFF: u16 = 0x00;
+    const WHITE: u16 = 0x01;
+    const GREEN: u16 = 0x1e;
+    const RED: u16 = 0x55;
+    const DIM_RED: u16 = 0x56;
+    const AMBER: u16 = 0x2b;
+    const DIM_AMBER: u16 = 0x2c;
+    const ROW_BRIGHT: [u16; 4] = [0x25, 0x2b, 0x1e, 0x18];
+    const ROW_DIM: [u16; 4] = [0x26, 0x2c, 0x1f, 0x19];
+    const ENCODER_LEDS: usize = 34;
+
+    if pads.is_null() || !gp_active() {
+        return;
+    }
+    match gp_u8(GP_PAGE) {
+        0 => {
+            let held = gp_u32(GP_HELD);
+            let last = gp_u8(GP_LAST_PAD) as u32;
+            for pad in 0..32u32 {
+                let row = (pad / 8) as usize;
+                let color = if held & (1 << pad) != 0 {
+                    ROW_BRIGHT[row]
+                } else if pad == last {
+                    WHITE
+                } else {
+                    ROW_DIM[row]
+                };
+                write_volatile(pads.add(pad as usize), color);
+            }
+        }
+        1 => {
+            let encoder = gp_u8(GP_LAST_ENCODER) as u32;
+            for column in 0..8u32 {
+                write_volatile(pads.add(column as usize), if column == encoder { AMBER } else { OFF });
+            }
+            let delta = gp_u32(GP_LAST_DELTA) as i32;
+            let color = if delta < 0 { RED } else { GREEN };
+            gp_bar(pads, 1, delta.unsigned_abs().min(8), color, OFF);
+            if read_volatile(GP_STATE.add(GP_PRESSURE_COUNT) as *const u16) == 0 {
+                gp_bar(pads, 2, 0, OFF, DIM_RED);
+            } else {
+                gp_bar(pads, 2, (gp_u8(GP_PRESSURE) as u32 * 8 + 127) / 128, ROW_BRIGHT[2], OFF);
+            }
+            gp_bar(pads, 3, (gp_u8(GP_VELOCITY) as u32 * 8 + 126) / 127, ROW_BRIGHT[3], OFF);
+        }
+        2 => {
+            gp_binary(pads, 0, gp_u32(GP_AVG_US), WHITE, ROW_DIM[0]);
+            gp_binary(pads, 2, gp_u32(GP_MAX_US), WHITE, ROW_DIM[0]);
+        }
+        3 => {
+            if gp_u8(GP_DSP_OK) == 0 {
+                gp_binary(pads, 0, 0, OFF, DIM_RED);
+                gp_binary(pads, 2, 0, OFF, DIM_RED);
+            } else {
+                gp_binary(pads, 0, gp_u32(GP_DSP_AVG), WHITE, ROW_DIM[1]);
+                gp_binary(pads, 2, gp_u32(GP_DSP_MIN), WHITE, ROW_DIM[1]);
+            }
+        }
+        #[cfg(granular_retrigger)]
+        LAB_PAGE => lab_paint(pads),
+        #[cfg(granular_retrigger)]
+        LAB_STATS_PAGE => {
+            gp_binary(pads, 0, lab_u32(LAB_COST_US), WHITE, ROW_DIM[2]);
+            gp_binary(pads, 2, lab_u32(LAB_LATE), WHITE, ROW_DIM[2]);
+        }
+        _ => {
+            gp_binary(pads, 0, gp_u32(GP_MHZ), WHITE, ROW_DIM[3]);
+            if gp_u8(GP_DSP_OK) == 0 {
+                gp_binary(pads, 2, 0, OFF, DIM_RED);
+            } else {
+                gp_binary(pads, 2, gp_u32(GP_DSP_RATE), WHITE, ROW_DIM[3]);
+            }
+        }
+    }
+    let leds = pads.add(ENCODER_LEDS);
+    if gp_u8(GP_PAGE) == 3 {
+        let burn = gp_u8(GP_BURN) as usize;
+        for index in 0..8usize {
+            write_volatile(leds.add(index), if index < burn { RED } else { OFF });
+        }
+    } else {
+        for index in 0..8usize {
+            let value = gp_u8(GP_ENCODERS + index);
+            let color = match value {
+                0 => OFF,
+                1..=63 => DIM_AMBER,
+                _ => AMBER,
+            };
+            write_volatile(leds.add(index), color);
+        }
+    }
+    #[cfg(granular_retrigger)]
+    if gp_u8(GP_PAGE) == LAB_PAGE {
+        lab_paint_encoders(leds);
+    }
+}
+
+/// Granular probe B: a retrigger / micro-loop lab on the overlay's track
+/// (page 5) with its cost counters (page 6: grain critical-section µs, late
+/// grains). It drives the track's voice directly, as key groups do: under the
+/// audio lock it shadow-writes mode (param 1), reverse (2), start (7/14) and
+/// length (8/15) with `0x0804070F`, then plays note 60 through the unlocked
+/// note-on `0x08040875`. Stopping hard-stops the voice and writes the stored
+/// values back, so the project is never changed. Slope (param 9) is left to
+/// the track's own setting.
+///
+/// Pads 0-15 pick the start (16 positions, 1024 units apart); pads 16-23 the
+/// length (whole, then 4096 .. 16 units); pad 24 repeats one-shot grains,
+/// pad 25 repeats gated grains released 2 ms early, pad 26 holds one note in
+/// native Loop mode (start and length changes are then written live without
+/// a retrigger, to test whether the DSP follows them); pad 27 toggles
+/// reverse; pad 31 stops. Encoders 1-3: interval (5-500 ms), start scrub,
+/// length fine.
+///
+/// UI handlers only change state; the Main-loop service does every lock and
+/// DSP transfer, outside the audio lock as `stereo_main_loop_tick` runs.
+#[cfg(granular_retrigger)]
+const LAB_PAGE: u8 = 5;
+#[cfg(granular_retrigger)]
+const LAB_STATS_PAGE: u8 = 6;
+#[cfg(granular_retrigger)]
+const LAB_MODE: usize = 96;
+#[cfg(granular_retrigger)]
+const LAB_REVERSE: usize = 97;
+#[cfg(granular_retrigger)]
+const LAB_STOP_REQUEST: usize = 98;
+#[cfg(granular_retrigger)]
+const LAB_VOICE: usize = 99;
+#[cfg(granular_retrigger)]
+const LAB_START: usize = 100;
+#[cfg(granular_retrigger)]
+const LAB_LENGTH: usize = 102;
+#[cfg(granular_retrigger)]
+const LAB_INTERVAL: usize = 104;
+#[cfg(granular_retrigger)]
+const LAB_PAIRED: usize = 106;
+#[cfg(granular_retrigger)]
+const LAB_DIRTY: usize = 107;
+#[cfg(granular_retrigger)]
+const LAB_NEXT_DUE: usize = 108;
+#[cfg(granular_retrigger)]
+const LAB_RELEASE_DUE: usize = 112;
+#[cfg(granular_retrigger)]
+const LAB_COST_US: usize = 116;
+#[cfg(granular_retrigger)]
+const LAB_LATE: usize = 120;
+#[cfg(granular_retrigger)]
+const LAB_GRAINS: usize = 124;
+#[cfg(granular_retrigger)]
+const LAB_RESTORE: usize = 128;
+#[cfg(granular_retrigger)]
+const LAB_TRIGGER: usize = 134;
+#[cfg(granular_retrigger)]
+const LAB_PARAMS: [u32; 6] = [1, 2, 7, 8, 14, 15];
+#[cfg(granular_retrigger)]
+const LAB_LENGTHS: [u16; 8] = [0x3fff, 4096, 2048, 1024, 512, 256, 64, 16];
+#[cfg(granular_retrigger)]
+const LAB_NO_VOICE: u8 = 0xff;
+#[cfg(granular_retrigger)]
+const LAB_OFF: u8 = 0;
+#[cfg(granular_retrigger)]
+const LAB_RETRIGGER: u8 = 1;
+#[cfg(granular_retrigger)]
+const LAB_GATE: u8 = 2;
+#[cfg(granular_retrigger)]
+const LAB_LOOP: u8 = 3;
+
+#[cfg(granular_retrigger)]
+unsafe fn lab_u16(offset: usize) -> u16 {
+    read_volatile(GP_STATE.add(offset) as *const u16)
+}
+
+#[cfg(granular_retrigger)]
+unsafe fn lab_set_u16(offset: usize, value: u16) {
+    write_volatile(GP_STATE.add(offset) as *mut u16, value);
+}
+
+#[cfg(granular_retrigger)]
+unsafe fn lab_u32(offset: usize) -> u32 {
+    gp_u32(offset)
+}
+
+#[cfg(granular_retrigger)]
+unsafe fn lab_init() {
+    gp_set_u8(LAB_VOICE, LAB_NO_VOICE);
+    lab_set_u16(LAB_LENGTH, 0x3fff);
+    lab_set_u16(LAB_INTERVAL, 100);
+}
+
+/// Asks the service to stop the running voice and restore its parameters.
+#[cfg(granular_retrigger)]
+unsafe fn lab_stop() {
+    if gp_u8(LAB_MODE) != LAB_OFF {
+        gp_set_u8(LAB_STOP_REQUEST, 1);
+    }
+}
+
+#[cfg(granular_retrigger)]
+unsafe fn lab_run(mode: u8) {
+    let tick = read_volatile(HAL_TICK);
+    if gp_u8(LAB_MODE) == LAB_OFF || gp_u8(LAB_STOP_REQUEST) != 0 {
+        if gp_u8(LAB_STOP_REQUEST) != 0 {
+            return;
+        }
+        let voice = gp_u8(GP_TRACK) as u32;
+        let channel = PLAYBACK_LEADER_TRACK + voice;
+        let get = function::<TrackParameterGet>(0x0804_6871);
+        for (index, parameter) in LAB_PARAMS.iter().enumerate() {
+            gp_set_u8(LAB_RESTORE + index, get(channel, *parameter) as u8);
+        }
+        let paired = voice < 7 && playback_pair_index(channel).is_some() && paired_pair_enabled(channel);
+        gp_set_u8(LAB_PAIRED, paired as u8);
+        gp_set_u8(LAB_VOICE, voice as u8);
+    }
+    gp_set_u8(LAB_MODE, mode);
+    gp_set_u8(LAB_DIRTY, 1);
+    gp_set_u8(LAB_TRIGGER, 1);
+    gp_set_u32(LAB_NEXT_DUE, tick);
+    gp_set_u32(LAB_RELEASE_DUE, 0);
+}
+
+#[cfg(granular_retrigger)]
+unsafe fn lab_pad(pad: u32) {
+    match pad {
+        0..=15 => {
+            lab_set_u16(LAB_START, (pad * 1024) as u16);
+            gp_set_u8(LAB_DIRTY, 1);
+        }
+        16..=23 => {
+            lab_set_u16(LAB_LENGTH, LAB_LENGTHS[pad as usize - 16]);
+            gp_set_u8(LAB_DIRTY, 1);
+        }
+        24 => lab_run(LAB_RETRIGGER),
+        25 => lab_run(LAB_GATE),
+        26 => lab_run(LAB_LOOP),
+        27 => {
+            gp_set_u8(LAB_REVERSE, (gp_u8(LAB_REVERSE) == 0) as u8);
+            gp_set_u8(LAB_DIRTY, 1);
+        }
+        31 => lab_stop(),
+        _ => {}
+    }
+}
+
+#[cfg(granular_retrigger)]
+unsafe fn lab_encoder(encoder: u32, delta: i32) {
+    match encoder {
+        0 => {
+            let interval = (lab_u16(LAB_INTERVAL) as i32 + delta * 5).clamp(5, 500);
+            lab_set_u16(LAB_INTERVAL, interval as u16);
+        }
+        1 => {
+            let start = (lab_u16(LAB_START) as i32 + delta * 16).clamp(0, 0x3fff);
+            lab_set_u16(LAB_START, start as u16);
+            gp_set_u8(LAB_DIRTY, 1);
+        }
+        2 => {
+            let length = (lab_u16(LAB_LENGTH) as i32 + delta * 4).clamp(1, 0x3fff);
+            lab_set_u16(LAB_LENGTH, length as u16);
+            gp_set_u8(LAB_DIRTY, 1);
+        }
+        _ => {}
+    }
+}
+
+/// One critical section on the running voice (and its pair follower):
+/// `Write` sends the lab's parameters, `Trigger` also plays the note,
+/// `Release` releases it (gate mode), `Stop` hard-stops it and restores the
+/// stored parameters.
+#[cfg(granular_retrigger)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LabAction {
+    Write,
+    Trigger,
+    Release,
+    Stop,
+}
+
+#[cfg(granular_retrigger)]
+unsafe fn lab_section(action: LabAction) {
+    const STOCK_DSP_UPDATE: usize = 0x0804_070f;
+    const LOCK_TAKE: usize = 0x0802_9c8d;
+    const LOCK_GIVE: usize = 0x0803_0eb9;
+    const NOTE_ON: usize = 0x0804_0875;
+    const RELEASE: usize = 0x0804_083d;
+    const HARD_STOP: usize = 0x0804_0815;
+    const NOTE: u32 = 60;
+    const VELOCITY: u32 = 100;
+
+    let program = read_volatile(DSP_PROGRAM_STATE);
+    let voice = gp_u8(LAB_VOICE) as u32;
+    if program == 0 || voice >= 8 {
+        return;
+    }
+    let voices = if gp_u8(LAB_PAIRED) != 0 { 2 } else { 1 };
+    let mode_value = match gp_u8(LAB_MODE) {
+        LAB_GATE => 1,
+        LAB_LOOP => 2,
+        _ => 0,
+    };
+    let start = lab_u16(LAB_START) as u32;
+    let length = lab_u16(LAB_LENGTH) as u32;
+    let values = [
+        mode_value,
+        gp_u8(LAB_REVERSE) as u32,
+        start >> 7,
+        length >> 7,
+        start & 0x7f,
+        length & 0x7f,
+    ];
+    let update = function::<TrackParameterDspUpdate>(STOCK_DSP_UPDATE);
+    let started = gp_cycles();
+    let lock = (program + 0xc) as *mut u8;
+    let mut guard = lock;
+    function::<unsafe extern "C" fn(*mut u8)>(LOCK_TAKE)(lock);
+    for offset in 0..voices {
+        let v = voice + offset;
+        let channel = PLAYBACK_LEADER_TRACK + v;
+        match action {
+            LabAction::Write | LabAction::Trigger => {
+                for (index, parameter) in LAB_PARAMS.iter().enumerate() {
+                    update(v, *parameter, values[index], 0);
+                }
+            }
+            LabAction::Release => {
+                function::<unsafe extern "C" fn(u32, u32)>(RELEASE)(channel, NOTE);
+            }
+            LabAction::Stop => {
+                function::<unsafe extern "C" fn(u32)>(HARD_STOP)(channel);
+                for (index, parameter) in LAB_PARAMS.iter().enumerate() {
+                    update(v, *parameter, gp_u8(LAB_RESTORE + index) as u32, 0);
+                }
+            }
+        }
+    }
+    if action == LabAction::Trigger {
+        for offset in 0..voices {
+            let channel = PLAYBACK_LEADER_TRACK + voice + offset;
+            function::<unsafe extern "C" fn(u32, u32, u32)>(NOTE_ON)(channel, NOTE, VELOCITY);
+        }
+    }
+    function::<unsafe extern "C" fn(*mut *mut u8)>(LOCK_GIVE)(&mut guard);
+    if action == LabAction::Trigger {
+        let mhz = gp_u32(GP_MHZ);
+        gp_set_u32(LAB_COST_US, gp_div(gp_cycles().wrapping_sub(started), mhz));
+        gp_set_u32(LAB_GRAINS, gp_u32(LAB_GRAINS).wrapping_add(1));
+    }
+}
+
+/// Main loop: at most one critical section per pass, so the 16-entry DSP
+/// event ring (stop + trigger = 2 entries per voice) is never flooded.
+#[cfg(granular_retrigger)]
+unsafe fn lab_service(tick: u32) {
+    let mode = gp_u8(LAB_MODE);
+    if mode == LAB_OFF {
+        return;
+    }
+    if gp_u8(LAB_STOP_REQUEST) != 0 {
+        lab_section(LabAction::Stop);
+        gp_set_u8(LAB_MODE, LAB_OFF);
+        gp_set_u8(LAB_VOICE, LAB_NO_VOICE);
+        gp_set_u8(LAB_STOP_REQUEST, 0);
+        return;
+    }
+    let due = |at: u32| (tick.wrapping_sub(at) as i32) >= 0;
+    if mode == LAB_LOOP {
+        if gp_u8(LAB_TRIGGER) != 0 {
+            gp_set_u8(LAB_TRIGGER, 0);
+            gp_set_u8(LAB_DIRTY, 0);
+            lab_section(LabAction::Trigger);
+        } else if gp_u8(LAB_DIRTY) != 0 {
+            gp_set_u8(LAB_DIRTY, 0);
+            lab_section(LabAction::Write);
+        }
+        return;
+    }
+    let release = gp_u32(LAB_RELEASE_DUE);
+    if release != 0 && due(release) {
+        gp_set_u32(LAB_RELEASE_DUE, 0);
+        lab_section(LabAction::Release);
+        return;
+    }
+    let next = gp_u32(LAB_NEXT_DUE);
+    if !due(next) {
+        return;
+    }
+    if tick.wrapping_sub(next) > 1 && gp_u8(LAB_TRIGGER) == 0 {
+        gp_set_u32(LAB_LATE, gp_u32(LAB_LATE).wrapping_add(1));
+    }
+    gp_set_u8(LAB_TRIGGER, 0);
+    gp_set_u8(LAB_DIRTY, 0);
+    lab_section(LabAction::Trigger);
+    let interval = lab_u16(LAB_INTERVAL).max(5) as u32;
+    let mut following = next.wrapping_add(interval);
+    if due(following) {
+        following = tick.wrapping_add(interval);
+    }
+    gp_set_u32(LAB_NEXT_DUE, following);
+    let release_at = following.wrapping_sub(2);
+    gp_set_u32(
+        LAB_RELEASE_DUE,
+        if mode == LAB_GATE { release_at.max(1) } else { 0 },
+    );
+}
+
+#[cfg(granular_retrigger)]
+unsafe fn lab_paint(pads: *mut u16) {
+    const WHITE: u16 = 0x01;
+    const OFF: u16 = 0x00;
+    const DIM_SKY: u16 = 0x19;
+    const AMBER: u16 = 0x2b;
+    const DIM_AMBER: u16 = 0x2c;
+    const GREEN: u16 = 0x1e;
+    const DIM_GREEN: u16 = 0x1f;
+    const TEAL: u16 = 0x25;
+    const DIM_TEAL: u16 = 0x26;
+    const RED: u16 = 0x55;
+    const DIM_RED: u16 = 0x56;
+
+    let start_pad = (lab_u16(LAB_START) / 1024) as usize;
+    for pad in 0..16usize {
+        write_volatile(pads.add(pad), if pad == start_pad { WHITE } else { DIM_SKY });
+    }
+    let length = lab_u16(LAB_LENGTH);
+    for (index, value) in LAB_LENGTHS.iter().enumerate() {
+        write_volatile(pads.add(16 + index), if *value == length { AMBER } else { DIM_AMBER });
+    }
+    let mode = gp_u8(LAB_MODE);
+    for (index, pad_mode) in [LAB_RETRIGGER, LAB_GATE, LAB_LOOP].iter().enumerate() {
+        write_volatile(pads.add(24 + index), if mode == *pad_mode { GREEN } else { DIM_GREEN });
+    }
+    write_volatile(pads.add(27), if gp_u8(LAB_REVERSE) != 0 { TEAL } else { DIM_TEAL });
+    for pad in 28..31usize {
+        write_volatile(pads.add(pad), OFF);
+    }
+    write_volatile(pads.add(31), if mode != LAB_OFF { RED } else { DIM_RED });
+}
+
+#[cfg(granular_retrigger)]
+unsafe fn lab_paint_encoders(leds: *mut u16) {
+    const OFF: u16 = 0x00;
+    const DIM_WHITE: u16 = 0x09;
+    const GREEN: u16 = 0x1e;
+    let color = if gp_u8(LAB_MODE) != LAB_OFF { GREEN } else { DIM_WHITE };
+    for index in 0..8usize {
+        write_volatile(leds.add(index), if index < 3 { color } else { OFF });
+    }
+}
+
+/// Granular micro-looper v1: Shift + Track opens a looper for that track on
+/// the pads and encoders (the same payload-owned overlay as the probe). Each
+/// track keeps its own loop, which goes on playing after the view is closed.
+///
+/// The loop drives the track's own voice (and its follower if the track leads
+/// a stereo pair) with the technique proven by probe B: under the audio lock
+/// the payload shadow-writes playback mode (param 1), reverse (2), start (7/14)
+/// and end (8/15) and plays the note itself. Native Loop mode follows start and
+/// end changes live, so moving the loop never retriggers it. Stutter repeats
+/// the region one-shot at a fixed interval. While a track loops, stock
+/// note-ons and note-offs for it are dropped and stock flushes of those six
+/// parameters are given the looper's values; Stop hard-stops the voice and
+/// rewrites the stored values, so the project is never changed.
+///
+/// Pads: rows 1-2 position (16 sixteenths of the sample; hold two to span
+/// them), row 3 size (whole down to 1/128), row 4 One Shot (stutter), Gated
+/// (stutter released at half the interval), Loop, Reverse, then a 4-pad rate
+/// bar (Choke and the three after it). In Loop mode
+/// the bar and encoder 4 control the tune instead, which sets the loop's rate. Encoders
+/// 1-4: tune (+/-24 semitones), start, length, rate (20-1000 ms).
+///
+/// Each mode pad cycles Off (dim) -> Preview (yellow) -> Armed (green) -> Off.
+/// A preview plays at once and stops when the view closes or moves to another
+/// track or page. An armed loop follows the transport (stop pauses it, start
+/// restarts it) and each note the track receives (sequencer, keys, MIDI)
+/// re-pitches it. Armed grains are played by those notes: while one is held,
+/// at its pitch and velocity. Armed tracks keep going after the view closes.
+///
+/// Up switches to the grain page (Down back to the looper; the arrow toward
+/// the other page is lit), which runs the core-B grain engine
+/// (`patches/granular-engine-dsp.s`) on the track's voice instead: up to 32
+/// overlapping windowed grains across the tracks, written as voice parameters
+/// 26-30. Pads: rows 1-2 position, row 3 grain size (400 ms down to 16 ms),
+/// row 4 pitch scatter (off / random octaves / octaves and fifths), grain
+/// shape (smooth / percussive / swell), Loop (the mode cycle), Reverse, then a
+/// 4-pad density bar. Pitch scatter lights red if the engine is missing.
+/// Encoders 1-5: tune, position, size, density, spray. The position, tune and
+/// reverse are shared with the looper page.
+#[cfg(granular_looper)]
+#[no_mangle]
+pub extern "C" fn granular_looper_marker() {}
+
+#[cfg(granular_looper)]
+const LP_STATE_LEN: usize = 176;
+#[cfg(granular_looper)]
+const LP_CURSOR: usize = 13;
+#[cfg(granular_looper)]
+const LP_PLAYING: usize = 14;
+/// Pending track select (track + 1, 0 none).
+#[cfg(granular_looper)]
+const LP_SELECT: usize = 15;
+/// Tune encoder detents not yet applied (i8).
+#[cfg(granular_looper)]
+const LP_TUNE_ACC: usize = 16;
+#[cfg(granular_looper)]
+const LP_TUNE_DETENTS: i32 = 3;
+#[cfg(granular_looper)]
+const LP_TRACKS: usize = 24;
+#[cfg(granular_looper)]
+const LP_STRIDE: usize = 19;
+#[cfg(granular_looper)]
+const LP_MODE: usize = 0;
+#[cfg(granular_looper)]
+const LP_FLAGS: usize = 1;
+#[cfg(granular_looper)]
+const LP_START: usize = 2;
+#[cfg(granular_looper)]
+const LP_SIZE: usize = 4;
+#[cfg(granular_looper)]
+const LP_INTERVAL: usize = 6;
+/// Due ticks are the low 16 bits of `HAL_TICK` (ms), compared as i16.
+#[cfg(granular_looper)]
+const LP_NEXT_DUE: usize = 8;
+/// Grain size in 2 ms units (7..=200).
+#[cfg(granular_looper)]
+const LP_GRAIN_SIZE: usize = 10;
+/// Grain density: overlapping grains in quarters (1..=32).
+#[cfg(granular_looper)]
+const LP_DENSITY: usize = 11;
+#[cfg(granular_looper)]
+const LP_PITCH: usize = 12;
+#[cfg(granular_looper)]
+const LP_VELOCITY: usize = 13;
+/// The note last triggered, for the gate release.
+#[cfg(granular_looper)]
+const LP_NOTE: usize = 14;
+#[cfg(granular_looper)]
+const LP_GATE_DUE: usize = 15;
+/// Grain position spray in 4 ms units (0..=250).
+#[cfg(granular_looper)]
+const LP_SPRAY: usize = 17;
+/// Overlay page: 0 looper, 1 grains (global).
+#[cfg(granular_looper)]
+const LP_PAGE: usize = 6;
+/// Last telemetry read, low 16 bits of `HAL_TICK` (global u16).
+#[cfg(granular_looper)]
+const GR_READ_TICK: usize = 18;
+/// Core-B engine magic seen (global).
+#[cfg(granular_looper)]
+const GR_OK: usize = 20;
+/// Per track, the last note an armed track received (unity until one does).
+/// The 8 bytes after the auto-sampler state, below `GP_STATE`.
+#[cfg(granular_looper)]
+const LP_NOTE_IN: *mut u8 = 0x2004_fd48 as *mut u8;
+/// Per track, grain pitch scatter (bits 0-1) and shape (bits 2-3). The 8 bytes
+/// after the key-group root table.
+#[cfg(granular_looper)]
+const LP_GRAIN_FX: *mut u8 = 0x2004_fcf8 as *mut u8;
+#[cfg(granular_looper)]
+const LP_OFF: u8 = 0;
+#[cfg(granular_looper)]
+const LP_LOOP: u8 = 1;
+#[cfg(granular_looper)]
+const LP_STUTTER: u8 = 2;
+#[cfg(granular_looper)]
+const LP_GATED: u8 = 3;
+/// Core-B grain engine (`patches/granular-engine-dsp.s`) on the track's voice.
+#[cfg(granular_looper)]
+const LP_GRAIN: u8 = 4;
+#[cfg(granular_looper)]
+const LP_REVERSE: u8 = 1;
+#[cfg(granular_looper)]
+const LP_PAIRED: u8 = 2;
+#[cfg(granular_looper)]
+const LP_DIRTY: u8 = 4;
+#[cfg(granular_looper)]
+const LP_TRIGGER: u8 = 8;
+#[cfg(granular_looper)]
+const LP_STOP: u8 = 16;
+/// Transport stopped (armed loops), or no note held (armed grains).
+#[cfg(granular_looper)]
+const LP_PAUSED: u8 = 32;
+#[cfg(granular_looper)]
+const LP_GATE: u8 = 64;
+/// Armed (else a preview, while the mode is on).
+#[cfg(granular_looper)]
+const LP_ARMED: u8 = 128;
+/// Position units: 14-bit start/end, as the voice engine takes them.
+#[cfg(granular_looper)]
+const LP_FULL: u32 = 0x4000;
+#[cfg(granular_looper)]
+const LP_SIZES: [u16; 8] = [0x4000, 0x2000, 0x1000, 0x800, 0x400, 0x200, 0x100, 0x80];
+#[cfg(granular_looper)]
+const LP_RATE_STEPS: [u16; 8] = [600, 400, 250, 150, 90, 55, 35, 25];
+#[cfg(granular_looper)]
+const LP_RATE_PADS: [u16; 4] = [400, 150, 55, 25];
+#[cfg(granular_looper)]
+const LP_MIN_INTERVAL: i32 = 20;
+#[cfg(granular_looper)]
+const LP_MAX_INTERVAL: i32 = 1000;
+/// Core-B voice parameter 31: nonzero opts the voice into the looper declick
+/// (`patches/looper-declick-dsp.s`). Stock never writes or reads it.
+#[cfg(granular_looper)]
+const LP_DECLICK_PARAM: u32 = 31;
+#[cfg(granular_looper)]
+const LP_PARAMS: [u32; 6] = [1, 2, 7, 8, 14, 15];
+/// Core-B voice parameters 26-30: the grain engine's position, window step,
+/// onset interval, rate and spray/gain. Stock never writes or reads them.
+#[cfg(granular_looper)]
+const GR_FIRST_PARAM: u32 = 26;
+#[cfg(granular_looper)]
+const GR_FRAMES_PER_MS: u32 = 48;
+/// Grain sizes for the size pads, in 2 ms units (400 ms down to 16 ms).
+#[cfg(granular_looper)]
+const GR_SIZES: [u8; 8] = [200, 125, 80, 50, 30, 20, 12, 8];
+/// Density bar steps, in quarters of a grain overlapping.
+#[cfg(granular_looper)]
+const GR_DENSITY_STEPS: [u8; 8] = [1, 2, 4, 6, 8, 12, 16, 24];
+/// Grain gain / 256 for each density (1..=32 quarters): min(128, 400/sqrt(d)).
+#[cfg(granular_looper)]
+const GR_GAINS: [u8; 32] = [
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 126, 120, 115, 110, 106, 103, 100, 97, 94, 91,
+    89, 87, 85, 83, 81, 80, 78, 76, 75, 74, 73, 71, 70,
+];
+/// Playback rate per semitone (-24..=24), 1.0 = 0x100000.
+#[cfg(granular_looper)]
+const GR_RATES: [u32; 49] = [
+    0x040000, 0x043ce4, 0x047d67, 0x04c1c0, 0x050a29, 0x0556e0, 0x05a828, 0x05fe44, 0x065980,
+    0x06ba28, 0x072090, 0x078d0e, 0x080000, 0x0879c8, 0x08facd, 0x09837f, 0x0a1451, 0x0aadc1,
+    0x0b504f, 0x0bfc88, 0x0cb2ff, 0x0d7450, 0x0e411f, 0x0f1a1c, 0x100000, 0x10f390, 0x11f59b,
+    0x1306fe, 0x1428a3, 0x155b81, 0x16a09e, 0x17f911, 0x1965ff, 0x1ae8a0, 0x1c823e, 0x1e3438,
+    0x200000, 0x21e71f, 0x23eb36, 0x260dfc, 0x285146, 0x2ab702, 0x2d413d, 0x2ff222, 0x32cbfd,
+    0x35d13f, 0x39047c, 0x3c6870, 0x400000,
+];
+#[cfg(granular_looper)]
+const GR_MAGIC_WORD: u32 = 0x0003_7f13;
+#[cfg(granular_looper)]
+const GR_MAGIC: u32 = 0x0047_524e;
+
+#[cfg(granular_looper)]
+unsafe fn lp_ptr(track: usize, offset: usize) -> *mut u8 {
+    GP_STATE.add(LP_TRACKS + track * LP_STRIDE + offset)
+}
+
+#[cfg(granular_looper)]
+unsafe fn lp_u8(track: usize, offset: usize) -> u8 {
+    read_volatile(lp_ptr(track, offset))
+}
+
+#[cfg(granular_looper)]
+unsafe fn lp_set_u8(track: usize, offset: usize, value: u8) {
+    write_volatile(lp_ptr(track, offset), value);
+}
+
+#[cfg(granular_looper)]
+unsafe fn lp_u16(track: usize, offset: usize) -> u16 {
+    core::ptr::read_unaligned(lp_ptr(track, offset) as *const u16)
+}
+
+#[cfg(granular_looper)]
+unsafe fn lp_set_u16(track: usize, offset: usize, value: u16) {
+    core::ptr::write_unaligned(lp_ptr(track, offset) as *mut u16, value);
+}
+
+#[cfg(granular_looper)]
+unsafe fn lp_has(track: usize, flag: u8) -> bool {
+    lp_u8(track, LP_FLAGS) & flag != 0
+}
+
+#[cfg(granular_looper)]
+unsafe fn lp_flag(track: usize, flag: u8, on: bool) {
+    let flags = lp_u8(track, LP_FLAGS);
+    lp_set_u8(track, LP_FLAGS, if on { flags | flag } else { flags & !flag });
+}
+
+#[cfg(granular_looper)]
+unsafe fn lp_note_in(track: usize) -> u8 {
+    read_volatile(LP_NOTE_IN.add(track & 7))
+}
+
+#[cfg(granular_looper)]
+unsafe fn lp_set_note_in(track: usize, note: u8) {
+    write_volatile(LP_NOTE_IN.add(track & 7), note);
+}
+
+#[cfg(granular_looper)]
+unsafe fn gr_fx(track: usize) -> u8 {
+    read_volatile(LP_GRAIN_FX.add(track & 7))
+}
+
+#[cfg(granular_looper)]
+unsafe fn gr_set_fx(track: usize, fx: u8) {
+    write_volatile(LP_GRAIN_FX.add(track & 7), fx);
+}
+
+/// The played pitch: the tune, plus the last note's offset once armed.
+#[cfg(granular_looper)]
+unsafe fn lp_pitch(track: usize) -> i32 {
+    let mut pitch = lp_u8(track, LP_PITCH) as i8 as i32;
+    if lp_has(track, LP_ARMED) {
+        pitch += lp_note_in(track) as i32 - KG_UNITY_NOTE as i32;
+    }
+    pitch
+}
+
+#[cfg(granular_looper)]
+unsafe fn emitter_init() {
+    for offset in 0..LP_STATE_LEN {
+        write_volatile(GP_STATE.add(offset), 0);
+    }
+    gp_set_u8(GP_LAST_PAD, GP_NO_PAD);
+    for track in 0..8 {
+        lp_set_u16(track, LP_SIZE, 0x800);
+        lp_set_u16(track, LP_INTERVAL, 200);
+        lp_set_u8(track, LP_VELOCITY, 100);
+        lp_set_u8(track, LP_GRAIN_SIZE, 50);
+        lp_set_u8(track, LP_DENSITY, 8);
+        lp_set_note_in(track, KG_UNITY_NOTE as u8);
+        gr_set_fx(track, 0);
+    }
+    gp_set_u32(0, GP_MAGIC);
+}
+
+/// The loop region's end, exclusive of the 14-bit range's top.
+#[cfg(granular_looper)]
+unsafe fn lp_end(track: usize) -> u32 {
+    (lp_u16(track, LP_START) as u32 + lp_u16(track, LP_SIZE) as u32).min(LP_FULL - 1)
+}
+
+/// Values for `LP_PARAMS`.
+#[cfg(granular_looper)]
+unsafe fn lp_values(track: usize) -> [u32; 6] {
+    let start = lp_u16(track, LP_START) as u32;
+    let end = lp_end(track);
+    [
+        match lp_u8(track, LP_MODE) {
+            LP_LOOP => 2,
+            LP_GATED => 1,
+            _ => 0,
+        },
+        lp_has(track, LP_REVERSE) as u32,
+        start >> 7,
+        end >> 7,
+        start & 0x7f,
+        end & 0x7f,
+    ]
+}
+
+/// The looping track (0-7) that drives `voice`, if any.
+#[cfg(granular_looper)]
+unsafe fn looper_owner(voice: u32) -> Option<usize> {
+    if !gp_ready() || voice >= 8 {
+        return None;
+    }
+    (0..8usize).find(|track| {
+        lp_u8(*track, LP_MODE) != LP_OFF
+            && (*track as u32 == voice || (lp_has(*track, LP_PAIRED) && *track as u32 + 1 == voice))
+    })
+}
+
+/// Note hooks: a looping track's stock notes are dropped.
+#[cfg(granular_looper)]
+unsafe fn looper_owns_track(track: u32) -> bool {
+    track
+        .checked_sub(PLAYBACK_LEADER_TRACK)
+        .and_then(|voice| looper_owner(voice))
+        .is_some()
+}
+
+/// Note hooks (stock notes on an owned track are dropped after this). Both
+/// run on the Main task, as the service does. Armed grains play while the
+/// track's latest note is held, at its pitch and velocity; an armed loop is
+/// re-pitched by each note. Previews ignore notes.
+///
+/// Out of line behind the C ABI, as `keygroup_note_on_hook` must be: inlining
+/// into `paired_playback_note_on` once miscompiled it.
+#[cfg(granular_looper)]
+#[inline(never)]
+extern "C" fn looper_note(track: u32, note: u32, velocity: u32, on: u32) {
+    unsafe { looper_note_inner(track, note, velocity, on != 0) }
+}
+
+#[cfg(granular_looper)]
+unsafe fn looper_note_inner(track: u32, note: u32, velocity: u32, on: bool) {
+    if track < PLAYBACK_LEADER_TRACK || track >= PLAYBACK_LEADER_TRACK + 8 {
+        return;
+    }
+    let Some(owner) = looper_owner(track - PLAYBACK_LEADER_TRACK) else {
+        return;
+    };
+    if !lp_has(owner, LP_ARMED) || lp_has(owner, LP_STOP) {
+        return;
+    }
+    let note = (note & 0x7f) as u8;
+    let mode = lp_u8(owner, LP_MODE);
+    if mode == LP_GRAIN {
+        if on {
+            lp_set_note_in(owner, note);
+            lp_set_u8(owner, LP_VELOCITY, velocity.clamp(1, 127) as u8);
+            lp_flag(owner, LP_PAUSED, false);
+            lp_flag(owner, LP_DIRTY, true);
+        } else if note == lp_note_in(owner) && !lp_has(owner, LP_PAUSED) {
+            lp_flag(owner, LP_PAUSED | LP_DIRTY, true);
+        }
+    } else if on && note != lp_note_in(owner) {
+        lp_set_note_in(owner, note);
+        lp_flag(owner, LP_DIRTY, true);
+        // A loop takes its pitch at note start.
+        if mode == LP_LOOP && !lp_has(owner, LP_PAUSED) {
+            lp_flag(owner, LP_TRIGGER, true);
+        }
+    }
+}
+
+/// Flush hook: a stock flush of a looped parameter gets the looper's value. A
+/// new sample (param 0) hard-stops the voice, so a loop is restarted on it.
+#[cfg(granular_looper)]
+unsafe fn looper_flush_value(voice: u32, parameter: u32, value: u32) -> u32 {
+    let Some(track) = looper_owner(voice) else {
+        return value;
+    };
+    if lp_u8(track, LP_MODE) == LP_GRAIN {
+        // The grain engine leaves the stock parameters alone.
+        return value;
+    }
+    if parameter == 0 {
+        if lp_u8(track, LP_MODE) == LP_LOOP {
+            lp_flag(track, LP_TRIGGER, true);
+        }
+        return value;
+    }
+    LP_PARAMS
+        .iter()
+        .zip(lp_values(track).iter())
+        .find(|(p, _)| **p == parameter)
+        .map(|(_, own)| *own)
+        .unwrap_or(value)
+}
+
+/// The overlay's track, moved to the leader when it is a stereo follower.
+#[cfg(granular_looper)]
+unsafe fn lp_target() -> usize {
+    let track = gp_u8(GP_TRACK) as u32 & 7;
+    if paired_follower_track(PLAYBACK_LEADER_TRACK + track) {
+        (track - 1) as usize
+    } else {
+        track as usize
+    }
+}
+
+#[cfg(granular_looper)]
+unsafe fn lp_start(track: usize, mode: u8, velocity: u32) {
+    if lp_u8(track, LP_MODE) == LP_OFF {
+        let channel = PLAYBACK_LEADER_TRACK + track as u32;
+        let paired = playback_pair_index(channel).is_some() && paired_pair_enabled(channel);
+        lp_flag(track, LP_PAIRED, paired);
+    }
+    lp_set_u8(track, LP_VELOCITY, velocity.clamp(1, 127) as u8);
+    lp_flag(track, LP_STOP | LP_PAUSED | LP_GATE | LP_ARMED, false);
+    lp_flag(track, LP_TRIGGER | LP_DIRTY, true);
+    lp_set_u16(track, LP_NEXT_DUE, read_volatile(HAL_TICK) as u16);
+    lp_set_u8(track, LP_MODE, mode);
+}
+
+/// A mode pad: Off (or another mode) -> Preview -> Armed -> Off.
+#[cfg(granular_looper)]
+unsafe fn lp_cycle(track: usize, mode: u8, velocity: u32) {
+    if lp_u8(track, LP_MODE) != mode || lp_has(track, LP_STOP) {
+        lp_start(track, mode, velocity);
+    } else if !lp_has(track, LP_ARMED) {
+        lp_arm(track);
+    } else {
+        lp_flag(track, LP_STOP, true);
+    }
+}
+
+/// Preview -> Armed. Grains go quiet until a note; a loop goes quiet until
+/// the transport runs.
+#[cfg(granular_looper)]
+unsafe fn lp_arm(track: usize) {
+    lp_flag(track, LP_ARMED, true);
+    lp_set_note_in(track, KG_UNITY_NOTE as u8);
+    lp_flag(track, LP_DIRTY, true);
+    if lp_u8(track, LP_MODE) == LP_GRAIN || gp_u8(LP_PLAYING) == 0 {
+        lp_flag(track, LP_TRIGGER | LP_GATE, false);
+        lp_flag(track, LP_PAUSED, true);
+    }
+}
+
+#[cfg(granular_looper)]
+unsafe fn lp_pad(pad: u32, velocity: u32) {
+    if gp_u8(LP_PAGE) == 1 {
+        gr_pad(pad, velocity);
+        return;
+    }
+    let track = lp_target();
+    match pad {
+        0..=15 => {
+            let others = gp_u32(GP_HELD) & 0xffff & !(1 << pad);
+            let (first, last) = if others != 0 {
+                let low = others.trailing_zeros();
+                let high = 31 - others.leading_zeros();
+                (pad.min(low), pad.max(high))
+            } else {
+                (pad, pad)
+            };
+            lp_set_u16(track, LP_START, (first * 1024) as u16);
+            if first != last {
+                lp_set_u16(track, LP_SIZE, ((last - first + 1) * 1024) as u16);
+            }
+            lp_flag(track, LP_DIRTY, true);
+        }
+        16..=23 => {
+            if let Some(size) = LP_SIZES.get(pad as usize - 16) {
+                lp_set_u16(track, LP_SIZE, *size);
+                lp_flag(track, LP_DIRTY, true);
+            }
+        }
+        24 => lp_cycle(track, LP_STUTTER, velocity),
+        25 => lp_cycle(track, LP_GATED, velocity),
+        26 => lp_cycle(track, LP_LOOP, velocity),
+        27 => {
+            lp_flag(track, LP_REVERSE, !lp_has(track, LP_REVERSE));
+            lp_flag(track, LP_DIRTY, true);
+            // Direction is taken at note start, so a running loop restarts.
+            if lp_u8(track, LP_MODE) == LP_LOOP && !lp_has(track, LP_PAUSED) {
+                lp_flag(track, LP_TRIGGER, true);
+            }
+        }
+        28..=31 if lp_u8(track, LP_MODE) == LP_LOOP => {
+            lp_set_pitch(track, (pad as i32 - 27) * 12 - 24);
+        }
+        28..=31 => {
+            if let Some(rate) = LP_RATE_PADS.get(pad as usize - 28) {
+                lp_set_u16(track, LP_INTERVAL, *rate);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Sets the tune (+/-24); a running loop restarts at the new pitch.
+#[cfg(granular_looper)]
+unsafe fn lp_set_pitch(track: usize, pitch: i32) {
+    lp_set_u8(track, LP_PITCH, pitch.clamp(-24, 24) as i8 as u8);
+    lp_flag(track, LP_DIRTY, true);
+    if lp_u8(track, LP_MODE) == LP_LOOP && !lp_has(track, LP_PAUSED) {
+        lp_flag(track, LP_TRIGGER, true);
+    }
+}
+
+#[cfg(granular_looper)]
+unsafe fn lp_encoder(encoder: u32, delta: i32) {
+    let track = lp_target();
+    match encoder {
+        0 => {
+            let total = gp_u8(LP_TUNE_ACC) as i8 as i32 + delta;
+            let steps = total / LP_TUNE_DETENTS;
+            gp_set_u8(LP_TUNE_ACC, (total % LP_TUNE_DETENTS) as i8 as u8);
+            if steps != 0 {
+                lp_set_pitch(track, lp_u8(track, LP_PITCH) as i8 as i32 + steps);
+            }
+        }
+        // In Loop mode the tune is the loop's rate, so encoder 4 mirrors encoder 1.
+        3 if lp_u8(track, LP_MODE) == LP_LOOP => lp_encoder(0, delta),
+        1 => {
+            let start = (lp_u16(track, LP_START) as i32 + delta * 32).clamp(0, LP_FULL as i32 - 2);
+            lp_set_u16(track, LP_START, start as u16);
+            lp_flag(track, LP_DIRTY, true);
+        }
+        2 => {
+            let size = lp_u16(track, LP_SIZE) as i32;
+            let step = (size / 16).max(2);
+            lp_set_u16(track, LP_SIZE, (size + delta * step).clamp(2, LP_FULL as i32) as u16);
+            lp_flag(track, LP_DIRTY, true);
+        }
+        3 => {
+            // Clockwise is faster, in steps proportional to the interval.
+            let interval = lp_u16(track, LP_INTERVAL) as i32;
+            let step = (interval / 16).max(1);
+            let next = (interval - delta * step).clamp(LP_MIN_INTERVAL, LP_MAX_INTERVAL);
+            lp_set_u16(track, LP_INTERVAL, next as u16);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(granular_looper)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopAction {
+    Write,
+    Trigger,
+    Release,
+    Stop,
+    /// A paused loop: silenced and given back its stock parameters, but kept.
+    Halt,
+}
+
+/// One audio-lock critical section on a track's voice and its follower.
+#[cfg(granular_looper)]
+unsafe fn lp_section(track: usize, action: LoopAction) {
+    const STOCK_DSP_UPDATE: usize = 0x0804_070f;
+    const TRACK_PARAMETER_GET: usize = 0x0804_6871;
+    const LOCK_TAKE: usize = 0x0802_9c8d;
+    const LOCK_GIVE: usize = 0x0803_0eb9;
+    const NOTE_ON: usize = 0x0804_0875;
+    const RELEASE: usize = 0x0804_083d;
+    const HARD_STOP: usize = 0x0804_0815;
+
+    let program = read_volatile(DSP_PROGRAM_STATE);
+    if program == 0 {
+        return;
+    }
+    let voices = if lp_has(track, LP_PAIRED) && track < 7 { 2 } else { 1 };
+    let values = lp_values(track);
+    let note = (KG_UNITY_NOTE as i32 + lp_pitch(track)).clamp(0, 110) as u32;
+    let velocity = lp_u8(track, LP_VELOCITY).max(1) as u32;
+    let update = function::<TrackParameterDspUpdate>(STOCK_DSP_UPDATE);
+    let get = function::<TrackParameterGet>(TRACK_PARAMETER_GET);
+    let lock = (program + 0xc) as *mut u8;
+    let mut guard = lock;
+    function::<unsafe extern "C" fn(*mut u8)>(LOCK_TAKE)(lock);
+    for offset in 0..voices {
+        let voice = track as u32 + offset;
+        let channel = PLAYBACK_LEADER_TRACK + voice;
+        if action == LoopAction::Release {
+            function::<unsafe extern "C" fn(u32, u32)>(RELEASE)(channel, lp_u8(track, LP_NOTE) as u32);
+            continue;
+        }
+        if action == LoopAction::Stop {
+            function::<unsafe extern "C" fn(u32)>(HARD_STOP)(channel);
+        }
+        for (parameter, own) in LP_PARAMS.iter().zip(values.iter()) {
+            let value = if action == LoopAction::Stop { get(channel, *parameter) } else { *own };
+            update(voice, *parameter, value, 0);
+        }
+        update(voice, LP_DECLICK_PARAM, (action != LoopAction::Stop) as u32, 0);
+        // No grains on a voice the looper drives (it may come from grain mode).
+        update(voice, GR_FIRST_PARAM + 2, 0, 0);
+    }
+    if action == LoopAction::Trigger {
+        for offset in 0..voices {
+            let channel = PLAYBACK_LEADER_TRACK + track as u32 + offset;
+            function::<unsafe extern "C" fn(u32, u32, u32)>(NOTE_ON)(channel, note, velocity);
+        }
+        lp_set_u8(track, LP_NOTE, note as u8);
+    }
+    function::<unsafe extern "C" fn(*mut *mut u8)>(LOCK_GIVE)(&mut guard);
+}
+
+/// Values for grain parameters 26-30 (interval 0 while paused or stopping).
+#[cfg(granular_looper)]
+unsafe fn gr_values(track: usize, run: bool) -> [u32; 5] {
+    let size = lp_u8(track, LP_GRAIN_SIZE).clamp(7, 200) as u32 * 2 * GR_FRAMES_PER_MS;
+    // Window step per 32-frame block: 2^23 / (size / 32).
+    let step = gp_div(1 << 28, size);
+    let density = lp_u8(track, LP_DENSITY).clamp(1, 32) as u32;
+    // Interval bits 16-17 pitch scatter, 18-19 grain shape.
+    let fx = gr_fx(track) as u32 & 0xf;
+    let interval = if run { gp_div(size * 4, density).clamp(96, 0xffff) | fx << 16 } else { 0 };
+    let pitch = lp_pitch(track).clamp(-24, 24);
+    let mut rate = GR_RATES[(pitch + 24) as usize];
+    if lp_has(track, LP_REVERSE) {
+        rate = rate.wrapping_neg() & 0xff_ffff;
+    }
+    let spray = (lp_u8(track, LP_SPRAY) as u32 * 4 * GR_FRAMES_PER_MS).min(0xffff);
+    let mut gain = GR_GAINS[density as usize - 1] as u32;
+    if lp_has(track, LP_ARMED) {
+        gain = gp_div(gain * lp_u8(track, LP_VELOCITY).clamp(1, 127) as u32, 127);
+    }
+    [
+        (lp_u16(track, LP_START) as u32 & (LP_FULL - 1)) << 9,
+        step,
+        interval,
+        rate,
+        spray | gain << 16,
+    ]
+}
+
+/// One grain critical section on a track's voice and its follower: Trigger
+/// silences the stock voice and restores its stock parameters first (it may
+/// come from the looper); Stop writes interval 0, so playing grains finish.
+#[cfg(granular_looper)]
+unsafe fn gr_section(track: usize, action: LoopAction) {
+    const STOCK_DSP_UPDATE: usize = 0x0804_070f;
+    const TRACK_PARAMETER_GET: usize = 0x0804_6871;
+    const LOCK_TAKE: usize = 0x0802_9c8d;
+    const LOCK_GIVE: usize = 0x0803_0eb9;
+    const HARD_STOP: usize = 0x0804_0815;
+
+    let program = read_volatile(DSP_PROGRAM_STATE);
+    if program == 0 {
+        return;
+    }
+    let voices = if lp_has(track, LP_PAIRED) && track < 7 { 2 } else { 1 };
+    let run = action != LoopAction::Stop && !lp_has(track, LP_PAUSED);
+    let values = gr_values(track, run);
+    let update = function::<TrackParameterDspUpdate>(STOCK_DSP_UPDATE);
+    let get = function::<TrackParameterGet>(TRACK_PARAMETER_GET);
+    let lock = (program + 0xc) as *mut u8;
+    let mut guard = lock;
+    function::<unsafe extern "C" fn(*mut u8)>(LOCK_TAKE)(lock);
+    for offset in 0..voices {
+        let voice = track as u32 + offset;
+        let channel = PLAYBACK_LEADER_TRACK + voice;
+        if action == LoopAction::Trigger {
+            function::<unsafe extern "C" fn(u32)>(HARD_STOP)(channel);
+            for parameter in LP_PARAMS.iter() {
+                update(voice, *parameter, get(channel, *parameter), 0);
+            }
+            update(voice, LP_DECLICK_PARAM, 0, 0);
+        }
+        for (index, value) in values.iter().enumerate() {
+            update(voice, GR_FIRST_PARAM + index as u32, *value, 0);
+        }
+    }
+    function::<unsafe extern "C" fn(*mut *mut u8)>(LOCK_GIVE)(&mut guard);
+}
+
+#[cfg(granular_looper)]
+unsafe fn gr_pad(pad: u32, velocity: u32) {
+    let track = lp_target();
+    match pad {
+        0..=15 => lp_set_u16(track, LP_START, (pad * 1024) as u16),
+        16..=23 => lp_set_u8(track, LP_GRAIN_SIZE, GR_SIZES[pad as usize - 16]),
+        24 => gr_set_fx(track, (gr_fx(track) & !3) | ((gr_fx(track) & 3) + 1) % 3),
+        25 => gr_set_fx(track, (gr_fx(track) & 3) | (((gr_fx(track) >> 2 & 3) + 1) % 3) << 2),
+        26 => {
+            lp_cycle(track, LP_GRAIN, velocity);
+            return;
+        }
+        27 => lp_flag(track, LP_REVERSE, !lp_has(track, LP_REVERSE)),
+        28..=31 => lp_set_u8(track, LP_DENSITY, GR_DENSITY_STEPS[(pad as usize - 28) * 2 + 1]),
+        _ => return,
+    }
+    lp_flag(track, LP_DIRTY, true);
+}
+
+/// Steps a u8 setting by about 1/16 of its value per detent.
+#[cfg(granular_looper)]
+unsafe fn gr_nudge(track: usize, offset: usize, delta: i32, low: i32, high: i32) {
+    let value = lp_u8(track, offset) as i32;
+    let step = (value / 16).max(1);
+    lp_set_u8(track, offset, (value + delta * step).clamp(low, high) as u8);
+    lp_flag(track, LP_DIRTY, true);
+}
+
+#[cfg(granular_looper)]
+unsafe fn gr_encoder(encoder: u32, delta: i32) {
+    let track = lp_target();
+    match encoder {
+        0 | 1 => lp_encoder(encoder, delta),
+        2 => gr_nudge(track, LP_GRAIN_SIZE, delta, 7, 200),
+        3 => {
+            let density = lp_u8(track, LP_DENSITY) as i32 + delta;
+            lp_set_u8(track, LP_DENSITY, density.clamp(1, 32) as u8);
+            lp_flag(track, LP_DIRTY, true);
+        }
+        4 => gr_nudge(track, LP_SPRAY, delta, 0, 250),
+        _ => {}
+    }
+}
+
+/// Engine telemetry for the grain page, four times a second.
+#[cfg(granular_looper)]
+unsafe fn gr_read_telemetry(tick: u32) {
+    const DSP_READ: usize = 0x0803_14d7;
+    if !gp_active() || gp_u8(LP_PAGE) != 1 {
+        return;
+    }
+    let last = core::ptr::read_unaligned(GP_STATE.add(GR_READ_TICK) as *const u16);
+    if (tick as u16).wrapping_sub(last) < 250 {
+        return;
+    }
+    core::ptr::write_unaligned(GP_STATE.add(GR_READ_TICK) as *mut u16, tick as u16);
+    let read = function::<DspRead>(DSP_READ);
+    let magic = (read(0, GR_MAGIC_WORD) >> 8) & 0xff_ffff;
+    gp_set_u8(GR_OK, (magic == GR_MAGIC) as u8);
+}
+
+/// Mode pad colour: dim off, yellow preview, green armed (dim while an armed
+/// track waits for the transport or a note).
+#[cfg(granular_looper)]
+unsafe fn lp_mode_color(track: usize, own: u8) -> u16 {
+    const DIM_WHITE: u16 = 0x09;
+    const GREEN: u16 = 0x1e;
+    const DIM_GREEN: u16 = 0x1f;
+    const YELLOW: u16 = 0x2f;
+    if lp_u8(track, LP_MODE) != own || lp_has(track, LP_STOP) {
+        DIM_WHITE
+    } else if !lp_has(track, LP_ARMED) {
+        YELLOW
+    } else if lp_has(track, LP_PAUSED) {
+        DIM_GREEN
+    } else {
+        GREEN
+    }
+}
+
+#[cfg(granular_looper)]
+unsafe fn gr_paint(pads: *mut u16) {
+    const OFF: u16 = 0x00;
+    const WHITE: u16 = 0x01;
+    const RED: u16 = 0x55;
+    const SKY: u16 = 0x18;
+    const DIM_SKY: u16 = 0x19;
+    const AMBER: u16 = 0x2b;
+    const DIM_AMBER: u16 = 0x2c;
+    const ROSE: u16 = 0x3b;
+    const ORANGE: u16 = 0x43;
+    const DIM_ORANGE: u16 = 0x44;
+    const PURPLE: u16 = 0x47;
+    const DIM_PURPLE: u16 = 0x48;
+    const PINK: u16 = 0x67;
+    const TAN: u16 = 0x6e;
+    const DIM_TAN: u16 = 0x8f;
+    const ENCODER_LEDS: usize = 34;
+
+    let track = lp_target();
+    let on = lp_u8(track, LP_MODE) == LP_GRAIN;
+    let position = lp_u16(track, LP_START) as u32 / 1024;
+    for pad in 0..16u32 {
+        let color = if pad != position {
+            OFF
+        } else if on {
+            WHITE
+        } else {
+            SKY
+        };
+        write_volatile(pads.add(pad as usize), color);
+    }
+    let size = lp_u8(track, LP_GRAIN_SIZE);
+    let size_index = GR_SIZES.iter().position(|preset| *preset <= size).unwrap_or(7);
+    for index in 0..8usize {
+        write_volatile(pads.add(16 + index), if index == size_index { AMBER } else { DIM_AMBER });
+    }
+    // Pad 24: pitch scatter (red if the engine is missing); pad 25: shape.
+    let fx = gr_fx(track);
+    let scatter = if gp_u8(GR_OK) == 0 {
+        RED
+    } else {
+        [DIM_PURPLE, PURPLE, PINK][(fx & 3).min(2) as usize]
+    };
+    write_volatile(pads.add(24), scatter);
+    write_volatile(pads.add(25), [DIM_ORANGE, ORANGE, ROSE][(fx >> 2 & 3).min(2) as usize]);
+    write_volatile(pads.add(26), lp_mode_color(track, LP_GRAIN));
+    write_volatile(pads.add(27), if lp_has(track, LP_REVERSE) { TAN } else { DIM_TAN });
+    let density = lp_u8(track, LP_DENSITY);
+    let level = GR_DENSITY_STEPS.iter().filter(|step| **step <= density).count();
+    for index in 0..4usize {
+        let color = if level >= 2 * index + 2 {
+            AMBER
+        } else if level == 2 * index + 1 {
+            DIM_AMBER
+        } else {
+            OFF
+        };
+        write_volatile(pads.add(28 + index), color);
+    }
+    let leds = pads.add(ENCODER_LEDS);
+    let pitch = if lp_u8(track, LP_PITCH) != 0 { TAN } else { DIM_TAN };
+    let spray = if lp_u8(track, LP_SPRAY) != 0 { SKY } else { DIM_SKY };
+    for (index, color) in [pitch, SKY, AMBER, AMBER, spray, OFF, OFF, OFF].iter().enumerate() {
+        write_volatile(leds.add(index), *color);
+    }
+}
+
+#[cfg(granular_looper)]
+fn lp_reached(tick: u32, due: u16) -> bool {
+    (tick as u16).wrapping_sub(due) as i16 >= 0
+}
+
+/// The next action a track needs, if any.
+#[cfg(granular_looper)]
+unsafe fn lp_due(track: usize, tick: u32) -> Option<LoopAction> {
+    let mode = lp_u8(track, LP_MODE);
+    if mode == LP_OFF {
+        None
+    } else if lp_has(track, LP_STOP) {
+        Some(LoopAction::Stop)
+    } else if mode == LP_GRAIN {
+        // Paused grains still take writes: the pause itself is one.
+        if lp_has(track, LP_TRIGGER) {
+            Some(LoopAction::Trigger)
+        } else if lp_has(track, LP_DIRTY) {
+            Some(LoopAction::Write)
+        } else {
+            None
+        }
+    } else if lp_has(track, LP_PAUSED) {
+        lp_has(track, LP_DIRTY).then_some(LoopAction::Halt)
+    } else if lp_has(track, LP_TRIGGER) {
+        Some(LoopAction::Trigger)
+    } else if lp_has(track, LP_GATE) && lp_reached(tick, lp_u16(track, LP_GATE_DUE)) {
+        Some(LoopAction::Release)
+    } else if mode != LP_LOOP && lp_reached(tick, lp_u16(track, LP_NEXT_DUE)) {
+        Some(LoopAction::Trigger)
+    } else if lp_has(track, LP_DIRTY) {
+        Some(LoopAction::Write)
+    } else {
+        None
+    }
+}
+
+/// Transport playing: the transport (root `+0x60`, `FUN_08050250`) observable
+/// at `+0x14`, which decides whether Play starts or stops.
+#[cfg(granular_looper)]
+unsafe fn lp_transport_playing(root: *const u8) -> Option<bool> {
+    if root.is_null() {
+        return None;
+    }
+    let transport = read_u32(root, 0x60) as *const u8;
+    if transport.is_null() {
+        return None;
+    }
+    Some(gp_observable_byte(read_u32(transport, 0x14)) != 0)
+}
+
+/// Transport stop silences the voices: armed loops pause (and are halted) and
+/// restart from their start with the transport; armed grains stop with it,
+/// until the next note. Previews ignore the transport, so a preview loop that
+/// stock silenced is retriggered.
+#[cfg(granular_looper)]
+unsafe fn lp_follow_transport(root: *const u8, tick: u32) {
+    let Some(playing) = lp_transport_playing(root) else {
+        return;
+    };
+    if (gp_u8(LP_PLAYING) != 0) == playing {
+        return;
+    }
+    gp_set_u8(LP_PLAYING, playing as u8);
+    for track in 0..8usize {
+        let mode = lp_u8(track, LP_MODE);
+        if mode == LP_OFF || lp_has(track, LP_STOP) {
+            continue;
+        }
+        if !lp_has(track, LP_ARMED) {
+            if !playing && mode != LP_GRAIN {
+                lp_flag(track, LP_TRIGGER, true);
+            }
+        } else if mode == LP_GRAIN {
+            if !playing {
+                lp_flag(track, LP_PAUSED | LP_DIRTY, true);
+            }
+        } else if playing {
+            lp_flag(track, LP_PAUSED | LP_GATE, false);
+            lp_flag(track, LP_TRIGGER | LP_DIRTY, true);
+            lp_set_u16(track, LP_NEXT_DUE, tick as u16);
+        } else {
+            lp_flag(track, LP_TRIGGER | LP_GATE, false);
+            lp_flag(track, LP_PAUSED | LP_DIRTY, true);
+        }
+    }
+}
+
+/// A preview plays only while the view shows its track and page.
+#[cfg(granular_looper)]
+unsafe fn lp_end_previews() {
+    let shown = if gp_active() { lp_target() } else { usize::MAX };
+    let grain_page = gp_u8(LP_PAGE) == 1;
+    for track in 0..8usize {
+        let mode = lp_u8(track, LP_MODE);
+        if mode == LP_OFF || lp_has(track, LP_ARMED) {
+            continue;
+        }
+        if track != shown || (mode == LP_GRAIN) != grain_page {
+            lp_flag(track, LP_STOP, true);
+        }
+    }
+}
+
+/// Main loop: overlay auto-exit, then at most one critical section per pass
+/// (round robin over the tracks), which keeps the 16-entry DSP event ring safe.
+#[cfg(granular_looper)]
+unsafe fn service_emitter() {
+    if !gp_ready() {
+        return;
+    }
+    let root = gp_root();
+    if gp_active() && (root.is_null() || !gp_can_show(root) || gp_view(root) != gp_u8(GP_VIEW)) {
+        lp_close();
+    }
+    lp_service_select(root);
+    let tick = read_volatile(HAL_TICK);
+    lp_follow_transport(root, tick);
+    lp_end_previews();
+    gr_read_telemetry(tick);
+    let cursor = gp_u8(LP_CURSOR) as usize;
+    for step in 0..8usize {
+        let track = (cursor + step) & 7;
+        let Some(action) = lp_due(track, tick) else {
+            continue;
+        };
+        match action {
+            LoopAction::Stop if lp_u8(track, LP_MODE) == LP_GRAIN => {
+                gr_section(track, LoopAction::Stop);
+                lp_set_u8(track, LP_MODE, LP_OFF);
+                lp_set_u8(track, LP_FLAGS, lp_u8(track, LP_FLAGS) & LP_REVERSE);
+            }
+            LoopAction::Stop => {
+                lp_section(track, LoopAction::Stop);
+                lp_set_u8(track, LP_MODE, LP_OFF);
+                lp_set_u8(track, LP_FLAGS, lp_u8(track, LP_FLAGS) & LP_REVERSE);
+            }
+            LoopAction::Trigger | LoopAction::Write if lp_u8(track, LP_MODE) == LP_GRAIN => {
+                lp_flag(track, LP_TRIGGER | LP_DIRTY, false);
+                gr_section(track, action);
+            }
+            LoopAction::Trigger => {
+                lp_flag(track, LP_TRIGGER | LP_DIRTY | LP_GATE, false);
+                lp_section(track, LoopAction::Trigger);
+                let mode = lp_u8(track, LP_MODE);
+                if mode != LP_LOOP {
+                    let interval = lp_u16(track, LP_INTERVAL).max(LP_MIN_INTERVAL as u16);
+                    let mut next = lp_u16(track, LP_NEXT_DUE).wrapping_add(interval);
+                    if lp_reached(tick, next) {
+                        next = (tick as u16).wrapping_add(interval);
+                    }
+                    lp_set_u16(track, LP_NEXT_DUE, next);
+                    if mode == LP_GATED {
+                        lp_set_u16(track, LP_GATE_DUE, (tick as u16).wrapping_add(interval / 2));
+                        lp_flag(track, LP_GATE, true);
+                    }
+                }
+            }
+            LoopAction::Release => {
+                lp_flag(track, LP_GATE, false);
+                lp_section(track, LoopAction::Release);
+            }
+            LoopAction::Write => {
+                lp_flag(track, LP_DIRTY, false);
+                lp_section(track, LoopAction::Write);
+            }
+            LoopAction::Halt => {
+                lp_flag(track, LP_DIRTY, false);
+                lp_section(track, LoopAction::Stop);
+            }
+        }
+        gp_set_u8(LP_CURSOR, ((track + 1) & 7) as u8);
+        return;
+    }
+}
+#[cfg(granular_looper)]
+unsafe fn lp_close() {
+    gp_set_u8(GP_ACTIVE, 0);
+    gp_set_u32(GP_HELD, 0);
+}
+
+/// Root button press, ahead of the pairing gesture. `Some` swallows the press.
+/// Closing the view leaves every loop running.
+/// Asks for the view's track (its leader if a stereo follower) to be selected.
+/// `service_emitter` taps its button through stock once Shift is up, so the
+/// track buttons follow exactly as for a plain press.
+#[cfg(granular_looper)]
+unsafe fn lp_select(_root: *const u8) {
+    gp_set_u8(LP_SELECT, lp_target() as u8 + 1);
+}
+
+/// Pending track select: stock press `0x0803D8B8` + release `0x0803DDB0`,
+/// called directly (not through the hooked vtable), when no button is held
+/// and Shift is up (stock ignores track buttons under Shift).
+#[cfg(granular_looper)]
+unsafe fn lp_service_select(root: *mut u8) {
+    let pending = gp_u8(LP_SELECT);
+    if pending == 0 || root.is_null() || read_u8(root, 0xa0) != 0 {
+        return;
+    }
+    if gp_observable_byte(read_u32(root, 0x0c)) != 0 {
+        return;
+    }
+    gp_set_u8(LP_SELECT, 0);
+    let track = (pending - 1) as u32 & 7;
+    function::<SidechainPadInput>(0x0803_d8b9)(root, track, 0, 0);
+    function::<SidechainPadInput>(0x0803_ddb1)(root, track, 0, 0);
+}
+
+#[cfg(granular_looper)]
+unsafe fn emitter_button(root: *mut u8, button: u32, context: u32) -> Option<u32> {
+    const RECORD: u32 = 0x10;
+    const PLAY: u32 = 0x11;
+    // Stock raises the octave on 0x13 and lowers it on 0x14.
+    const UP: u32 = 0x13;
+    const DOWN: u32 = 0x14;
+    const SHIFT: u32 = 0x1b;
+
+    if root.is_null() || !gp_ready() {
+        return None;
+    }
+    let shift = gp_observable_byte(read_u32(root, 0x0c)) != 0;
+    if !gp_active() {
+        if button < 8 && shift && gp_can_show(root) {
+            gp_open(root, button);
+            lp_select(root);
+            gp_release_latched_shift(root);
+            return Some(context);
+        }
+        return None;
+    }
+    match button {
+        0..=7 if shift => {
+            if gp_u8(GP_TRACK) as u32 == button {
+                lp_close();
+            } else {
+                gp_set_u8(GP_TRACK, button as u8);
+                lp_select(root);
+            }
+            gp_release_latched_shift(root);
+            Some(context)
+        }
+        0..=7 => {
+            gp_set_u8(GP_TRACK, button as u8);
+            None
+        }
+        UP | DOWN => {
+            // Up: grains page; Down: looper page.
+            let page = (button == UP) as u8;
+            if gp_u8(LP_PAGE) != page {
+                gp_set_u8(LP_PAGE, page);
+                gp_set_u32(GP_HELD, 0);
+            }
+            Some(context)
+        }
+        RECORD | PLAY | SHIFT => None,
+        _ => {
+            lp_close();
+            Some(context)
+        }
+    }
+}
+
+/// Root pad press (vtable slot `0x080672E4`, stock `0x0803D7FE`).
+#[cfg(granular_looper)]
+#[no_mangle]
+pub unsafe extern "C" fn emitter_pad_press(root: *mut u8, pad: u32, velocity: u32, context: u32) -> u32 {
+    if gp_active() && pad < 32 && !gp_locked(root) {
+        gp_set_u32(GP_HELD, gp_u32(GP_HELD) | (1 << pad));
+        lp_pad(pad, velocity);
+        return context;
+    }
+    function::<SidechainPadInput>(0x0803_d7ff)(root, pad, velocity, context)
+}
+
+/// Root pad release (slot `0x080672E8`, stock `0x0803D896`); a pad held from
+/// before the view opened is released to stock.
+#[cfg(granular_looper)]
+#[no_mangle]
+pub unsafe extern "C" fn emitter_pad_release(root: *mut u8, pad: u32, a: u32, context: u32) -> u32 {
+    if gp_ready() && pad < 32 {
+        gp_set_u32(GP_HELD, gp_u32(GP_HELD) & !(1 << pad));
+        let stock_held = !root.is_null()
+            && read_u8(root, 0x9c + (pad as usize >> 3)) & (1 << (pad & 7)) != 0;
+        if gp_active() && !stock_held {
+            return context;
+        }
+    }
+    function::<SidechainPadInput>(0x0803_d897)(root, pad, a, context)
+}
+
+/// Root encoder turn (slot `0x080672F4`, stock `0x0803DDE0`).
+#[cfg(granular_looper)]
+#[no_mangle]
+pub unsafe extern "C" fn emitter_encoder(root: *mut u8, encoder: u32, delta: i32, context: u32) -> u32 {
+    if gp_active() && encoder < 8 && !gp_locked(root) {
+        if gp_u8(LP_PAGE) == 1 {
+            gr_encoder(encoder, delta);
+        } else {
+            lp_encoder(encoder, delta);
+        }
+        return context;
+    }
+    function::<SidechainPadInput>(0x0803_dde1)(root, encoder, delta as u32, context)
+}
+
+/// Root pad pressure (slot `0x080672FC`, stock `0x0803DE0A`): swallowed while
+/// the view is open.
+#[cfg(granular_looper)]
+#[no_mangle]
+pub unsafe extern "C" fn emitter_pressure(root: *mut u8, pad: u32, value: u32, context: u32) -> u32 {
+    if gp_active() && !gp_locked(root) {
+        return context;
+    }
+    function::<SidechainPadInput>(0x0803_de0b)(root, pad, value, context)
+}
+
+#[cfg(granular_looper)]
+unsafe fn emitter_paint(pads: *mut u16) {
+    const OFF: u16 = 0x00;
+    const WHITE: u16 = 0x01;
+    const SKY: u16 = 0x18;
+    const DIM_SKY: u16 = 0x19;
+    const AMBER: u16 = 0x2b;
+    const DIM_AMBER: u16 = 0x2c;
+    const TAN: u16 = 0x6e;
+    const DIM_TAN: u16 = 0x8f;
+    const ENCODER_LEDS: usize = 34;
+
+    if pads.is_null() || !gp_active() {
+        return;
+    }
+    // Up/Down (cells 32/33) lit as stock lights them: the way to the other
+    // page bright, the end of the range off.
+    let grain_page = gp_u8(LP_PAGE) == 1;
+    write_volatile(pads.add(32), if grain_page { OFF } else { WHITE });
+    write_volatile(pads.add(33), if grain_page { WHITE } else { OFF });
+    if grain_page {
+        gr_paint(pads);
+        return;
+    }
+    let track = lp_target();
+    let mode = lp_u8(track, LP_MODE);
+    let start = lp_u16(track, LP_START) as u32;
+    let first = start / 1024;
+    let last = (lp_end(track).max(start + 1) - 1) / 1024;
+    for pad in 0..16u32 {
+        let color = if pad == first {
+            if mode != LP_OFF { WHITE } else { SKY }
+        } else if pad > first && pad <= last {
+            DIM_SKY
+        } else {
+            OFF
+        };
+        write_volatile(pads.add(pad as usize), color);
+    }
+    let size = lp_u16(track, LP_SIZE);
+    let size_index = LP_SIZES.iter().position(|preset| *preset <= size).unwrap_or(7);
+    for index in 0..8usize {
+        write_volatile(pads.add(16 + index), if index == size_index { AMBER } else { DIM_AMBER });
+    }
+    let row = [
+        lp_mode_color(track, LP_STUTTER),
+        lp_mode_color(track, LP_GATED),
+        lp_mode_color(track, LP_LOOP),
+        if lp_has(track, LP_REVERSE) { TAN } else { DIM_TAN },
+    ];
+    for (index, color) in row.iter().enumerate() {
+        write_volatile(pads.add(24 + index), *color);
+    }
+    // Rate bar: eight steps over four pads, half steps dim. In Loop mode it
+    // shows the tune (-24..+24, 0 = two pads).
+    let level = if mode == LP_LOOP {
+        ((lp_u8(track, LP_PITCH) as i8 as i32 + 24).clamp(0, 48) as usize * 8 + 24) / 48
+    } else {
+        let interval = lp_u16(track, LP_INTERVAL);
+        LP_RATE_STEPS.iter().filter(|step| interval <= **step).count()
+    };
+    for index in 0..4usize {
+        let color = if level >= 2 * index + 2 {
+            AMBER
+        } else if level == 2 * index + 1 {
+            DIM_AMBER
+        } else {
+            OFF
+        };
+        write_volatile(pads.add(28 + index), color);
+    }
+    let leds = pads.add(ENCODER_LEDS);
+    let pitch = if lp_u8(track, LP_PITCH) != 0 { TAN } else { DIM_TAN };
+    for (index, color) in [pitch, SKY, AMBER, AMBER, OFF, OFF, OFF, OFF].iter().enumerate() {
+        write_volatile(leds.add(index), *color);
+    }
+}
 /// Wraps the layer's observer handler (primary vtable slot `0x08067218`),
 /// which ends in the render.
 #[cfg(stereo_position_poc)]
@@ -7706,6 +9876,8 @@ pub unsafe extern "C" fn stereo_main_loop_tick() {
     service_keygroup_image();
     #[cfg(keygroup_poc)]
     service_autosampler();
+    #[cfg(emitter)]
+    service_emitter();
     #[cfg(not(stereo_stock_save_queue))]
     service_deferred_stereo_refresh();
     #[cfg(all(sample_pair_identity_poc, native_dual_capture_poc))]
@@ -9984,7 +12156,7 @@ native_dsp_upload_primary_b:
     bne 1b
     cbz r6, 2f
     mov r4, r6
-    movw r5, #1134
+    ldr r5, native_dsp_package_bytes
     movs r6, #0
     b 1b
 2:
@@ -10017,6 +12189,11 @@ native_dsp_upload_primary_b:
 native_dsp_extension_pointer:
     .word 0
     .size native_dsp_extension_pointer, 4
+    .global native_dsp_package_bytes
+    .type native_dsp_package_bytes,%object
+native_dsp_package_bytes:
+    .word 0
+    .size native_dsp_package_bytes, 4
     .size native_dsp_upload_primary_b, .-native_dsp_upload_primary_b
 "#
 );

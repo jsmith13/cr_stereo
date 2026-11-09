@@ -22,6 +22,89 @@ OVERLAY_RAW_BASE = 0x2A33
 EXTENSION_BASE = 0x0D32
 EXTENSION_LIMIT = 0x1000
 EXTENSION_MAX_WORDS = EXTENSION_LIMIT - EXTENSION_BASE
+# Granular probe builds only: core-B load telemetry in its own loader record
+# after the capture extension. Its two hooks are one-word short `jsr`s, so the
+# record must stay below P:$1000. The hook sites live in the stock loader
+# record at P:$0100 (raw = VMA - $E8), not in the relocated overlay.
+PROBE_BASE = 0x0EC0
+PROBE_LIMIT = 0x1000
+SHORT_JSR = 0x0D0000
+# Granular looper builds only: the core-B refill copy declick. The first word
+# (`move a,n5`) of each stock copy routine in the relocated overlay becomes a
+# short `jmp` to the wrapper, which must therefore stay below P:$1000.
+DECLICK_BASE = 0x0F00
+DECLICK_LIMIT = 0x1000
+SHORT_JMP = 0x0C0000
+STOCK_MOVE_A_N5 = 0x21DD00
+# Granular looper builds only: the core-B grain engine. The main loop's
+# `jsr $0221` (voice pass) becomes a short jsr to the hook just above the
+# declick record. The engine itself is too large for internal P, so it runs
+# from shared memory at $37400 (P/X/Y alias one array): the loader puts a
+# master copy in internal Y:$1800, which the hook copies to $37400 whenever the
+# magic word there is missing.
+ENGINE_INTERNAL_BASE = 0x0FA0
+ENGINE_INTERNAL_LIMIT = 0x1000
+ENGINE_SHARED_BASE = 0x037400
+ENGINE_MASTER_Y = 0x1800
+ENGINE_MASTER_LIMIT = 0x2000
+ENGINE_MAGIC = 0x47524E
+ENGINE_HOOK_VMA = 0x011D
+ENGINE_HOOK_STOCK = 0x0D0221
+LOADER_SPACE_Y = 2
+
+
+@dataclass(frozen=True)
+class DeclickHook:
+    name: str
+    vma: int
+    entry: str
+    raw: int
+    stock_words: tuple[int, ...]
+    long_branch: int | None = None
+
+    def replacement_words(self, entry_address: int) -> tuple[int, ...]:
+        if self.long_branch is None:
+            return (SHORT_JMP | entry_address,)
+        return (self.long_branch, entry_address)
+
+
+# Raw offsets differ per loader record; main() re-derives each from the stock
+# stream and refuses to build if they disagree.
+DECLICK_HOOKS = (
+    DeclickHook("declick_copy_forward", 0x073D, "dk_forward", 0x073D + OVERLAY_RAW_BASE,
+                (STOCK_MOVE_A_N5,)),
+    DeclickHook("declick_copy_reverse", 0x0798, "dk_reverse", 0x0798 + OVERLAY_RAW_BASE,
+                (STOCK_MOVE_A_N5,)),
+    # Envelope jump-table entry 4 (`bra $0636`): the retrigger fade-out.
+    DeclickHook("declick_stage4", 0x05D2, "dk_stage4", 0x2FFE, (0x050CC4,)),
+    # `jsne >$02FD` in the pending-start loop: defer a start while fading out.
+    DeclickHook("declick_start", 0x02F2, "dk_start", 0x2B2F, (0x0BF0A2, 0x0002FD), 0x0BF0A2),
+)
+
+
+def p_raw_offset(words: list[int], vma: int) -> int:
+    index = 2
+    while index < len(words) and words[index] <= 2:
+        space, count, destination = words[index : index + 3]
+        if space == 0 and destination <= vma < destination + count:
+            return index + 3 + vma - destination - 2
+        index += 3 + count
+    raise ValueError(f"P:${vma:04X} is not loaded by the stock stream")
+
+
+@dataclass(frozen=True)
+class ProbeHook:
+    name: str
+    vma: int
+    raw: int
+    entry: str
+    stock_word: int
+
+
+PROBE_HOOKS = (
+    ProbeHook("probe_idle_spin", 0x0111, 0x0029, "gp_idle_spin", 0x0D07F8),
+    ProbeHook("probe_block_end", 0x0126, 0x003E, "gp_block_end", 0x0D0A79),
+)
 
 
 @dataclass(frozen=True)
@@ -226,6 +309,97 @@ def word_pairs(words: dict[int, int], opcode: int) -> list[int]:
     ]
 
 
+def validate_probe(
+    words: dict[int, int], symbols: dict[str, int], extension_end: int
+) -> bytes:
+    if min(words) != PROBE_BASE:
+        raise ValueError(f"probe record does not begin at P:${PROBE_BASE:04X}")
+    if extension_end >= PROBE_BASE:
+        raise ValueError("capture extension overlaps the probe record")
+    if max(words) >= PROBE_LIMIT:
+        raise ValueError("probe record exceeds the short-jsr range")
+    for hook in PROBE_HOOKS:
+        entry = symbols.get(hook.entry)
+        if entry is None or not PROBE_BASE <= entry < PROBE_LIMIT:
+            raise ValueError(f"{hook.name}: missing or out-of-range probe entry")
+    spin = symbols["gp_idle_spin"]
+    if words.get(spin + 6) != 0x0AF080 or words.get(spin + 7) != 0x0007F8:
+        raise ValueError("probe idle spin does not resume stock P:$07F8")
+    block = symbols["gp_block_end"]
+    if words.get(block) != 0x0BF080 or words.get(block + 1) != 0x000A79:
+        raise ValueError("probe block hook does not call stock P:$0A79 first")
+    return b"".join(
+        u24(words.get(address, 0)) for address in range(PROBE_BASE, max(words) + 1)
+    )
+
+
+def validate_declick(
+    words: dict[int, int], symbols: dict[str, int], extension_end: int
+) -> bytes:
+    if min(words) != DECLICK_BASE:
+        raise ValueError(f"declick record does not begin at P:${DECLICK_BASE:04X}")
+    if extension_end >= DECLICK_BASE:
+        raise ValueError("capture extension overlaps the declick record")
+    if max(words) >= DECLICK_LIMIT:
+        raise ValueError("declick record exceeds the short-jump range")
+    for hook in DECLICK_HOOKS:
+        entry = symbols.get(hook.entry)
+        if entry is None or not DECLICK_BASE <= entry < DECLICK_LIMIT:
+            raise ValueError(f"{hook.name}: missing or out-of-range declick entry")
+        if hook.stock_words != (STOCK_MOVE_A_N5,):
+            continue
+        if words.get(entry) != STOCK_MOVE_A_N5:
+            raise ValueError(f"{hook.name}: wrapper does not replay the stock first word")
+        stock_rest = hook.vma + 1
+        if word_pairs(words, 0x0AF0AA).count(stock_rest) != 1:
+            raise ValueError(f"{hook.name}: unflagged voices do not resume stock")
+        if word_pairs(words, 0x0BF080).count(stock_rest) != 1:
+            raise ValueError(f"{hook.name}: flagged voices do not run the stock copy")
+    if word_pairs(words, 0x0AF0AA).count(0x0636) != 1 or word_pairs(words, 0x0AF0A9).count(0x0636) != 1:
+        raise ValueError("declick_stage4: unflagged or quiet voices do not finish in stock stage 4")
+    if word_pairs(words, 0x0AF0AA).count(0x02FD) != 2 or word_pairs(words, 0x0AF0A2).count(0x02FD) != 1:
+        raise ValueError("declick_start: non-deferred starts do not reach the stock voice start")
+    return b"".join(
+        u24(words.get(address, 0)) for address in range(DECLICK_BASE, max(words) + 1)
+    )
+
+
+def validate_engine(
+    words: dict[int, int], symbols: dict[str, int], declick_end: int
+) -> tuple[bytes, bytes]:
+    internal = {a: w for a, w in words.items() if a < ENGINE_INTERNAL_LIMIT}
+    shared = {a: w for a, w in words.items() if a >= ENGINE_SHARED_BASE}
+    if len(internal) + len(shared) != len(words):
+        raise ValueError("grain engine has words outside its two sections")
+    if min(internal) != ENGINE_INTERNAL_BASE:
+        raise ValueError(f"grain hook record does not begin at P:${ENGINE_INTERNAL_BASE:04X}")
+    if declick_end >= ENGINE_INTERNAL_BASE:
+        raise ValueError("declick record overlaps the grain hook record")
+    if symbols.get("ge_hook") != ENGINE_INTERNAL_BASE:
+        raise ValueError("ge_hook is not the first internal word")
+    if internal[ENGINE_INTERNAL_BASE] != ENGINE_HOOK_STOCK:
+        raise ValueError("grain hook does not run the stock voice pass first")
+    if min(shared) != ENGINE_SHARED_BASE or shared[ENGINE_SHARED_BASE] != ENGINE_MAGIC:
+        raise ValueError("grain engine does not begin with its magic word")
+    shared_words = max(shared) - ENGINE_SHARED_BASE + 1
+    if ENGINE_MASTER_Y + shared_words > ENGINE_MASTER_LIMIT:
+        raise ValueError("grain engine master copy exceeds Y:$1FFF")
+    if symbols.get("ge_end", 0) - ENGINE_SHARED_BASE != shared_words:
+        raise ValueError("grain engine length symbol does not match its words")
+    if symbols.get("ge_run") != ENGINE_SHARED_BASE + 1:
+        raise ValueError("ge_run does not follow the magic word")
+    copy_do = 0x060080 | ((shared_words & 0xFF) << 8) | (shared_words >> 8)
+    if copy_do not in internal.values():
+        raise ValueError("grain hook copy count does not match the engine length")
+    internal_payload = b"".join(
+        u24(internal.get(a, 0)) for a in range(ENGINE_INTERNAL_BASE, max(internal) + 1)
+    )
+    shared_payload = b"".join(
+        u24(shared.get(a, 0)) for a in range(ENGINE_SHARED_BASE, max(shared) + 1)
+    )
+    return internal_payload, shared_payload
+
+
 def validate_extension(
     words: dict[int, int], symbols: dict[str, int], stub_words: dict[int, int]
 ) -> dict[str, object]:
@@ -350,7 +524,26 @@ def main() -> None:
         type=Path,
         default=root / "tools" / "vendor" / "rust" / "cargo" / "bin" / "dsp56300-disasm.exe",
     )
+    parser.add_argument(
+        "--granular-probe",
+        action="store_true",
+        help="append the core-B load telemetry record (diagnostic builds only)",
+    )
+    parser.add_argument(
+        "--looper-declick",
+        action="store_true",
+        help="append the core-B refill declick record (granular looper builds only)",
+    )
+    parser.add_argument(
+        "--granular-engine",
+        action="store_true",
+        help="append the core-B grain engine (granular looper builds only; needs --looper-declick)",
+    )
     args = parser.parse_args()
+    if args.granular_probe and args.looper_declick:
+        raise ValueError("the granular probe and looper declick are exclusive")
+    if args.granular_engine and not args.looper_declick:
+        raise ValueError("the grain engine requires the looper declick")
 
     image = args.image.read_bytes()
     if len(image) != EXPECTED_IMAGE_SIZE or sha256(image) != EXPECTED_IMAGE_SHA256:
@@ -395,6 +588,34 @@ def main() -> None:
                 f"{hook.name}: stock precondition failed at raw P:${hook.raw:04X}: "
                 f"expected {hook.stock_words}, found {actual}"
             )
+    if args.granular_probe:
+        for probe_hook in PROBE_HOOKS:
+            start = 6 + probe_hook.raw * 3
+            actual_word = int.from_bytes(primary[start : start + 3], "big")
+            if actual_word != probe_hook.stock_word:
+                raise ValueError(
+                    f"{probe_hook.name}: stock precondition failed at P:${probe_hook.vma:04X}"
+                )
+    if args.looper_declick:
+        stock_stream = [
+            int.from_bytes(primary[index : index + 3], "big")
+            for index in range(0, len(primary) - len(primary) % 3, 3)
+        ]
+        for declick_hook in DECLICK_HOOKS:
+            if p_raw_offset(stock_stream, declick_hook.vma) != declick_hook.raw:
+                raise AssertionError(f"{declick_hook.name}: raw offset does not match the loader stream")
+            start = 6 + declick_hook.raw * 3
+            width = 3 * len(declick_hook.stock_words)
+            if primary[start : start + width] != b"".join(map(u24, declick_hook.stock_words)):
+                raise ValueError(
+                    f"{declick_hook.name}: stock precondition failed at P:${declick_hook.vma:04X}"
+                )
+    engine_hook_raw = 0
+    if args.granular_engine:
+        engine_hook_raw = p_raw_offset(stock_stream, ENGINE_HOOK_VMA)
+        start = 6 + engine_hook_raw * 3
+        if primary[start : start + 3] != u24(ENGINE_HOOK_STOCK):
+            raise ValueError("grain engine hook: stock precondition failed at P:$011D")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     extension_lod = args.output_dir / "dual-native-mono-dsp-extension.lod"
@@ -417,11 +638,79 @@ def main() -> None:
 
     payload = packed_payload(extension_words)
     extension_count = len(payload) // 3
+    probe_record = b""
+    probe_payload = b""
+    probe_symbols: dict[str, int] = {}
+    if args.granular_probe:
+        probe_lod = args.output_dir / "granular-probe-dsp.lod"
+        probe_words, probe_symbols = assemble(
+            args.assembler,
+            root / "patches" / "granular-probe-dsp.s",
+            probe_lod,
+            args.output_dir / "granular-probe-dsp.lst",
+        )
+        probe_payload = validate_probe(probe_words, probe_symbols, max(extension_words))
+        probe_record = u24(0) + u24(len(probe_payload) // 3) + u24(PROBE_BASE) + probe_payload
+        disassemble(
+            args.disassembler,
+            probe_lod,
+            args.output_dir / "granular-probe-dsp.disasm.txt",
+        )
+    declick_record = b""
+    declick_payload = b""
+    declick_symbols: dict[str, int] = {}
+    if args.looper_declick:
+        declick_lod = args.output_dir / "looper-declick-dsp.lod"
+        declick_words, declick_symbols = assemble(
+            args.assembler,
+            root / "patches" / "looper-declick-dsp.s",
+            declick_lod,
+            args.output_dir / "looper-declick-dsp.lst",
+        )
+        declick_payload = validate_declick(
+            declick_words, declick_symbols, max(extension_words)
+        )
+        declick_record = (
+            u24(0) + u24(len(declick_payload) // 3) + u24(DECLICK_BASE) + declick_payload
+        )
+        disassemble(
+            args.disassembler,
+            declick_lod,
+            args.output_dir / "looper-declick-dsp.disasm.txt",
+        )
+    engine_record = b""
+    engine_internal = b""
+    engine_shared = b""
+    engine_symbols: dict[str, int] = {}
+    if args.granular_engine:
+        engine_lod = args.output_dir / "granular-engine-dsp.lod"
+        engine_words, engine_symbols = assemble(
+            args.assembler,
+            root / "patches" / "granular-engine-dsp.s",
+            engine_lod,
+            args.output_dir / "granular-engine-dsp.lst",
+        )
+        engine_internal, engine_shared = validate_engine(
+            engine_words, engine_symbols, DECLICK_BASE + len(declick_payload) // 3 - 1
+        )
+        engine_record = (
+            u24(0) + u24(len(engine_internal) // 3) + u24(ENGINE_INTERNAL_BASE) + engine_internal
+            + u24(LOADER_SPACE_Y) + u24(len(engine_shared) // 3) + u24(ENGINE_MASTER_Y)
+            + engine_shared
+        )
+        disassemble(
+            args.disassembler,
+            engine_lod,
+            args.output_dir / "granular-engine-dsp.disasm.txt",
+        )
     package = (
         u24(0)
         + u24(extension_count)
         + u24(EXTENSION_BASE)
         + payload
+        + probe_record
+        + declick_record
+        + engine_record
         + u24(0x000100)
     )
     package_path = args.output_dir / "dual-native-mono-dsp-extension.dsp24"
@@ -466,6 +755,69 @@ def main() -> None:
                 "replacement_bytes": replacement.hex().upper(),
             }
         )
+    for probe_hook in PROBE_HOOKS if args.granular_probe else ():
+        raw = probe_hook.raw
+        word = SHORT_JSR | probe_symbols[probe_hook.entry]
+        replacements.append(
+            {
+                "name": probe_hook.name,
+                "raw_lma_start": f"0x{raw:04X}",
+                "raw_lma_end_inclusive": f"0x{raw:04X}",
+                "runtime_vma_start": f"0x{probe_hook.vma:04X}",
+                "runtime_vma_end_inclusive": f"0x{probe_hook.vma:04X}",
+                "extension_entry": f"0x{probe_symbols[probe_hook.entry]:04X}",
+                "stock_continuation": f"0x{probe_hook.vma + 1:04X}",
+                "stock_precondition_words": [f"{probe_hook.stock_word:06X}"],
+                "stock_precondition_bytes": u24(probe_hook.stock_word).hex().upper(),
+                "replacement_words": [f"{word:06X}"],
+                "replacement_bytes": u24(word).hex().upper(),
+            }
+        )
+    for declick_hook in DECLICK_HOOKS if args.looper_declick else ():
+        raw = declick_hook.raw
+        entry_address = declick_symbols[declick_hook.entry]
+        new_words = declick_hook.replacement_words(entry_address)
+        last = len(new_words) - 1
+        replacements.append(
+            {
+                "name": declick_hook.name,
+                "raw_lma_start": f"0x{raw:04X}",
+                "raw_lma_end_inclusive": f"0x{raw + last:04X}",
+                "runtime_vma_start": f"0x{declick_hook.vma:04X}",
+                "runtime_vma_end_inclusive": f"0x{declick_hook.vma + last:04X}",
+                "extension_entry": f"0x{entry_address:04X}",
+                "stock_continuation": f"0x{declick_hook.vma + len(new_words):04X}",
+                "stock_precondition_words": [f"{w:06X}" for w in declick_hook.stock_words],
+                "stock_precondition_bytes": b"".join(map(u24, declick_hook.stock_words)).hex().upper(),
+                "replacement_words": [f"{w:06X}" for w in new_words],
+                "replacement_bytes": b"".join(map(u24, new_words)).hex().upper(),
+            }
+        )
+    if args.granular_engine:
+        word = SHORT_JSR | engine_symbols["ge_hook"]
+        replacements.append(
+            {
+                "name": "granular_engine_voice_pass",
+                "raw_lma_start": f"0x{engine_hook_raw:04X}",
+                "raw_lma_end_inclusive": f"0x{engine_hook_raw:04X}",
+                "runtime_vma_start": f"0x{ENGINE_HOOK_VMA:04X}",
+                "runtime_vma_end_inclusive": f"0x{ENGINE_HOOK_VMA:04X}",
+                "extension_entry": f"0x{engine_symbols['ge_hook']:04X}",
+                "stock_continuation": f"0x{ENGINE_HOOK_VMA + 1:04X}",
+                "stock_precondition_words": [f"{ENGINE_HOOK_STOCK:06X}"],
+                "stock_precondition_bytes": u24(ENGINE_HOOK_STOCK).hex().upper(),
+                "replacement_words": [f"{word:06X}"],
+                "replacement_bytes": u24(word).hex().upper(),
+            }
+        )
+    package_words = [
+        int.from_bytes(package[index : index + 3], "big")
+        for index in range(0, len(package), 3)
+    ]
+    stream = primary_words[:terminator_index] + package_words
+    stream_records, stream_end = parse_loader_records(stream)
+    if stream_end != len(stream) - 1 or stream[stream_end] != 0x000100:
+        raise ValueError("patched primary-B loader stream does not end at its terminator")
 
     metadata = {
         "schema": "circuit-rhythm-dual-native-mono-dsp-patch-v1",
@@ -501,6 +853,7 @@ def main() -> None:
             "maximum_word_count": EXTENSION_MAX_WORDS,
             "end_address_inclusive": f"0x{max(extension_words):04X}",
             "package_filename": package_path.name,
+            "package_bytes": len(package),
             "package_sha256": sha256(package),
             "payload_filename": payload_path.name,
             "payload_sha256": sha256(payload),
@@ -527,7 +880,45 @@ def main() -> None:
                 )[1]
                 == terminator_index + 3 + extension_count
             ),
+            "package_stream_records": len(stream_records) - len(primary_records),
         },
+        "granular_probe": (
+            {
+                "base": f"0x{PROBE_BASE:04X}",
+                "word_count": len(probe_payload) // 3,
+                "end_address_inclusive": f"0x{PROBE_BASE + len(probe_payload) // 3 - 1:04X}",
+                "telemetry": "Y:$37F00..$37F08 (shared)",
+            }
+            if args.granular_probe
+            else None
+        ),
+        "looper_declick": (
+            {
+                "base": f"0x{DECLICK_BASE:04X}",
+                "word_count": len(declick_payload) // 3,
+                "end_address_inclusive": (
+                    f"0x{DECLICK_BASE + len(declick_payload) // 3 - 1:04X}"
+                ),
+                "opt_in": "Y:(param block + 31) != 0",
+                "scratch": "X:$30..$33",
+            }
+            if args.looper_declick
+            else None
+        ),
+        "granular_engine": (
+            {
+                "hook_base": f"0x{ENGINE_INTERNAL_BASE:04X}",
+                "hook_word_count": len(engine_internal) // 3,
+                "engine_master_y": f"0x{ENGINE_MASTER_Y:04X}",
+                "engine_run_address": f"0x{ENGINE_SHARED_BASE:06X}",
+                "engine_word_count": len(engine_shared) // 3,
+                "params": "Y:(param block + 26..30)",
+                "state": "X:$2B00..$2E1F, X:$34..$35",
+                "telemetry": "Y:$37F10..$37F13 (shared)",
+            }
+            if args.granular_engine
+            else None
+        ),
         "invariants": invariants,
         "replacements": replacements,
         "round_trip_disassembly": True,

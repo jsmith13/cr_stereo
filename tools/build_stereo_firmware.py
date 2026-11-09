@@ -25,10 +25,10 @@ SECTOR_6_START = 0x08080000
 # 380,326 bytes was rejected and candidate 5 at 380,328 bytes was accepted, the
 # two differing only by tail padding that made the image word aligned. The real
 # invariant is the four-byte alignment enforced above. The largest image the
-# bootloader has actually accepted is 391,436 bytes (series-b), so that is the
-# proven ceiling. A rejected image is harmless - the bootloader refuses it and the
-# unit keeps its current firmware.
-PROVEN_NATIVE_BOOTLOADER_MAX_IMAGE_SIZE = 391436
+# bootloader has actually accepted is 399,460 bytes (grain-c, v0.3.0), so that
+# is the proven ceiling. A rejected image is harmless - the bootloader refuses
+# it and the unit keeps its current firmware.
+PROVEN_NATIVE_BOOTLOADER_MAX_IMAGE_SIZE = 399460
 STOCK_APPLICATION_BUILD = 5706
 BUILD_NUMBER_ADDRESS = 0x080101CA
 BUILD_STRING_ADDRESSES = (0x080101D9, 0x08025A5B)
@@ -208,6 +208,19 @@ PAIRED_PLAYBACK_MARKER = "paired_playback_marker"
 STEREO_POSITION_MARKER = "stereo_position_marker"
 NATIVE_DSP_EXTENSION_POINTER = "native_dsp_extension_pointer"
 NATIVE_DSP_CONTINUATION_BYTES = 1134
+NATIVE_DSP_PACKAGE_BYTES = "native_dsp_package_bytes"
+# Granular probe (diagnostic): emitter stub view on Shift+Track plus DSP load
+# telemetry. Root vtable 0x08067270 pad/encoder/pressure entries.
+GRANULAR_PROBE_MARKER = "granular_probe_marker"
+# Granular micro-looper: the same emitter view and root vtable hooks, no DSP
+# change.
+GRANULAR_LOOPER_MARKER = "granular_looper_marker"
+GRANULAR_PROBE_POINTER_HOOK = {
+    0x080672E4: ("emitter_pad_press", bytes.fromhex("ffd70308")),
+    0x080672E8: ("emitter_pad_release", bytes.fromhex("97d80308")),
+    0x080672F4: ("emitter_encoder", bytes.fromhex("e1dd0308")),
+    0x080672FC: ("emitter_pressure", bytes.fromhex("0bde0308")),
+}
 FIRMWARE_IMAGE_ALIGNMENT = 4
 NATIVE_CAPTURE_VTABLE_HOOK = {
     0x08066E80: ("native_capture_source_start", bytes.fromhex("6f440608")),
@@ -625,10 +638,33 @@ def apply_patches(
     extension_padding = extension_address - arm_payload_end
     if native_dual_capture_poc:
         assert native_dsp_package is not None
-        if len(native_dsp_package) != NATIVE_DSP_CONTINUATION_BYTES:
+        assert native_dsp_metadata is not None
+        if len(native_dsp_package) % 3 or len(native_dsp_package) < NATIVE_DSP_CONTINUATION_BYTES:
+            raise ValueError("Native DSP package is not a whole number of DSP words")
+        recorded_bytes = native_dsp_metadata["extension"].get(
+            "package_bytes", NATIVE_DSP_CONTINUATION_BYTES
+        )
+        if len(native_dsp_package) != recorded_bytes:
+            raise ValueError("Native DSP package size does not match its metadata")
+        if len(native_dsp_package) != NATIVE_DSP_CONTINUATION_BYTES and not (
+            native_dsp_metadata.get("granular_probe")
+            or native_dsp_metadata.get("looper_declick")
+            or native_dsp_metadata.get("granular_engine")
+        ):
             raise ValueError(
-                "Native DSP continuation size changed; update the compact upload wrapper"
+                "Native DSP continuation size changed without a granular probe, declick or engine record"
             )
+        length_symbol = find_map_symbol(payload_map, NATIVE_DSP_PACKAGE_BYTES)
+        if length_symbol is None:
+            raise ValueError("Payload map is missing the native DSP package length")
+        length_offset = length_symbol - PAYLOAD_ADDRESS
+        if not 0 <= length_offset <= len(payload) - 4:
+            raise ValueError("Native DSP package length lies outside the ARM payload")
+        if payload[length_offset : length_offset + 4] != bytes(4):
+            raise ValueError("Native DSP package length precondition is not zero")
+        payload[length_offset : length_offset + 4] = struct.pack(
+            "<I", len(native_dsp_package)
+        )
         payload_pointer = find_map_symbol(payload_map, NATIVE_DSP_EXTENSION_POINTER)
         if payload_pointer is None:
             raise ValueError(
@@ -826,6 +862,24 @@ def apply_patches(
         if not stereo_position_poc:
             raise ValueError("Key groups require stereo position")
         symbol_hooks.update(KEYGROUP_POINTER_HOOK)
+    granular_probe = find_map_symbol(payload_map, GRANULAR_PROBE_MARKER) is not None
+    probe_metadata = bool(native_dsp_metadata and native_dsp_metadata.get("granular_probe"))
+    if granular_probe != probe_metadata:
+        raise ValueError("Payload granular-probe cfg does not match the DSP package")
+    granular_looper = find_map_symbol(payload_map, GRANULAR_LOOPER_MARKER) is not None
+    declick_metadata = bool(native_dsp_metadata and native_dsp_metadata.get("looper_declick"))
+    if granular_looper != declick_metadata:
+        raise ValueError("Payload granular-looper cfg does not match the DSP declick record")
+    engine_metadata = bool(native_dsp_metadata and native_dsp_metadata.get("granular_engine"))
+    if granular_looper != engine_metadata:
+        raise ValueError("Payload granular-looper cfg does not match the DSP grain engine")
+    if granular_probe and granular_looper:
+        raise ValueError("The granular probe and looper are exclusive")
+    emitter = granular_probe or granular_looper
+    if emitter:
+        if not keygroup_poc:
+            raise ValueError("The emitter view requires key groups")
+        symbol_hooks.update(GRANULAR_PROBE_POINTER_HOOK)
     symbols = parse_map_symbols(payload_map, symbol_hooks)
     if keygroup_poc:
         symbols[KEYGROUP_MARKER] = find_map_symbol(payload_map, KEYGROUP_MARKER)
@@ -1199,6 +1253,18 @@ def apply_patches(
                     expected,
                     struct.pack("<I", symbols[symbol] | 1),
                     f"Redirect vtable slot to {symbol}",
+                )
+        if emitter:
+            for address, (symbol, expected) in GRANULAR_PROBE_POINTER_HOOK.items():
+                if stock.count(expected) != 1:
+                    raise ValueError(f"Pointer for {symbol} is not unique")
+                patch_bytes(
+                    image,
+                    changes,
+                    address,
+                    expected,
+                    struct.pack("<I", symbols[symbol] | 1),
+                    f"Redirect root vtable slot to {symbol}",
                 )
         table_literals = []
         for offset in range(0, EXPECTED_SIZE, 4):

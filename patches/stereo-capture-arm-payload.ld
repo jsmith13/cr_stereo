@@ -76,6 +76,12 @@ SECTIONS
         KEEP(*(.text.keygroup_bank_press))
         KEEP(*(.text.keygroup_group_press))
         KEEP(*(.text.sample_rec_record_press))
+        KEEP(*(.text.granular_probe_marker))
+        KEEP(*(.text.granular_looper_marker))
+        KEEP(*(.text.emitter_pad_press))
+        KEEP(*(.text.emitter_pad_release))
+        KEEP(*(.text.emitter_encoder))
+        KEEP(*(.text.emitter_pressure))
         *(.text*)
         *(.rodata*)
     }

@@ -85,6 +85,9 @@ param(
     [switch]$CropMirrorWindow,
     [switch]$KeygroupPoc,
     [switch]$KeygroupSeed,
+    [switch]$GranularProbe,
+    [switch]$GranularRetrigger,
+    [switch]$GranularLooper,
 
     [switch]$NativeWriterReadinessProbeDiagnostic,
 
@@ -157,7 +160,9 @@ if ($NativeDualCapturePoc) {
         (Join-Path $PSScriptRoot 'build_dual_native_mono_dsp.py') `
         --image (Join-Path $root 'circuitrhythm-firmware-5706.bin') `
         --primary-b (Join-Path $extractedDsp 'primary_b.dsp24') `
-        --output-dir $nativeDspOutput
+        --output-dir $nativeDspOutput `
+        @(if ($GranularProbe) { '--granular-probe' }) `
+        @(if ($GranularLooper) { '--looper-declick'; '--granular-engine' })
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
@@ -219,6 +224,9 @@ if ($NativeDualCapturePoc) {
     -CropMirrorWindow:$CropMirrorWindow `
     -KeygroupPoc:$KeygroupPoc `
     -KeygroupSeed:$KeygroupSeed `
+    -GranularProbe:$GranularProbe `
+    -GranularRetrigger:$GranularRetrigger `
+    -GranularLooper:$GranularLooper `
     -NativeWriterReadinessProbeDiagnostic:$NativeWriterReadinessProbeDiagnostic `
     -NativeWriterAcquisitionProbeDiagnostic:$NativeWriterAcquisitionProbeDiagnostic `
     -NativeArmTokenProbeDiagnostic:$NativeArmTokenProbeDiagnostic `

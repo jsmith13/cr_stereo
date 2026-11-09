@@ -83,6 +83,9 @@ param(
     [switch]$CropMirrorWindow,
     [switch]$KeygroupPoc,
     [switch]$KeygroupSeed,
+    [switch]$GranularProbe,
+    [switch]$GranularRetrigger,
+    [switch]$GranularLooper,
 
     [switch]$NativeWriterReadinessProbeDiagnostic,
 
@@ -283,6 +286,27 @@ if ($KeygroupSeed) {
         throw 'KeygroupSeed requires KeygroupPoc'
     }
     $rustcArguments += @('--cfg', 'keygroup_seed')
+}
+if ($GranularProbe) {
+    if (-not $KeygroupPoc) {
+        throw 'GranularProbe requires KeygroupPoc'
+    }
+    $rustcArguments += @('--cfg', 'granular_probe', '--cfg', 'emitter')
+}
+if ($GranularRetrigger) {
+    if (-not $GranularProbe) {
+        throw 'GranularRetrigger requires GranularProbe'
+    }
+    $rustcArguments += @('--cfg', 'granular_retrigger')
+}
+if ($GranularLooper) {
+    if (-not $KeygroupPoc) {
+        throw 'GranularLooper requires KeygroupPoc'
+    }
+    if ($GranularProbe) {
+        throw 'GranularLooper and GranularProbe are exclusive'
+    }
+    $rustcArguments += @('--cfg', 'granular_looper', '--cfg', 'emitter')
 }
 if ($CropMirrorWindow) {
     $rustcArguments += @('--cfg', 'crop_mirror_window')

@@ -11,7 +11,7 @@ locally. Never commit firmware images (`*.syx`, `*.bin`) or build output.
 Unofficial and unsupported by Novation. Flashing custom firmware is at your own
 risk. The official firmware can always be reinstalled through the bootloader.
 
-## Features (v0.2.0)
+## Features (v0.3.0)
 
 ### Stereo (since v0.1.0)
 
@@ -67,6 +67,38 @@ Built with `-KeygroupPoc` (part of the release command below).
   before memory runs out, so it is saved intact. Either case flashes rows 3
   and 4 red.
 
+### Micro-looper and grain engine (new in v0.3.0)
+
+Built with `-GranularLooper` (part of the release command below). Hold
+**Shift** and press a track button to open the view for that track (press it
+again to close). **Up** shows the grain page; **Down** returns to the looper
+page. The lit arrow points to the other page.
+
+Each mode pad cycles **Off** (dim) → **Preview** (yellow) → **Armed**
+(green) → Off. A preview plays at once and stops when the view closes or moves
+to another track or page. Armed tracks keep playing after the view closes.
+While a track is looping, its stock notes are replaced and the project's
+sample settings are not changed.
+
+- **Looper page:** rows 1 and 2 pick the position (sixteenths of the sample;
+  hold two pads to span them), row 3 the size (a whole sample down to 1/128).
+  Row 4 holds One Shot (stutter), Gated (stutter cut at half the interval),
+  Loop and Reverse, then a four-pad rate bar. Encoders: 1 tune (±24
+  semitones), 2 start, 3 length, 4 rate. In Loop mode the rate bar and
+  encoder 4 set the tune instead. Armed loops follow transport stop and
+  start, and every note the track receives (sequencer, keys or MIDI)
+  re-pitches the loop.
+- **Grain page:** a granular engine running on the DSP, with up to 32
+  overlapping grains across all tracks. Rows 1 and 2 pick the position,
+  row 3 the grain size (400 ms down to 16 ms). Row 4 holds pitch scatter
+  (off / random octaves / octaves and fifths; red if the engine is missing),
+  grain shape (smooth / percussive / swell), Loop (the mode cycle) and
+  Reverse, then a four-pad density bar. Encoders: 1 tune, 2 position, 3
+  size, 4 density, 5 spray. Armed grains are played by notes from the
+  sequencer, keys or MIDI: they sound while a note is held, at its pitch and
+  velocity.
+- Short fades at loop starts, loop seams and retriggers remove clicks.
+
 ## Requirements (Windows)
 
 - PowerShell 7 (`pwsh`).
@@ -108,7 +140,7 @@ pwsh tools\build_stereo_firmware.ps1 -OutputDirectory build\release `
   -NativeDualCapturePoc -SafePairGuard -SamplePairLedPoc -SamplePairIdentityPoc `
   -SamplePairGesturePoc -SamplePairWriterCouplingPoc -SampleCacheRefreshPoc `
   -PairedPlaybackPoc -StereoPositionPoc -StereoStockSaveQueue -CropMirrorWindow `
-  -KeygroupPoc
+  -KeygroupPoc -GranularLooper
 ```
 
 The output in `build\release` is:
@@ -117,13 +149,16 @@ The output in `build\release` is:
 - A `.bin` image.
 - A `.json` manifest that lists every patched byte range.
 
-v0.2.0 should reproduce this image exactly:
+v0.3.0 should reproduce this image exactly:
 
 | File | SHA-256 |
 |---|---|
-| `.bin` | `8F0A427E17A7F274E8E07ED1BA1F78C5A367BC99CC03D2D97557A51542B53217` |
-| `.syx` | `EBC7491185988B09EE1F450F391BBE5CAD7B05605DE9AB7F4D3833151717BDA0` |
+| `.bin` | `255F3566C8C1EAE3F249BF5C38487BAC5CDB8B7A37B03B9480DF4E6BC6B99DF2` |
+| `.syx` | `2D125C7CC57F126EBC5D9726C2EC32E8CB5B5BCDB4B6146ADDA8F89FBAE38642` |
 
+The v0.2.0 tag, built without `-GranularLooper`, gives `.bin`
+`8F0A427E17A7F274E8E07ED1BA1F78C5A367BC99CC03D2D97557A51542B53217`
+(`.syx` `EBC7491185988B09EE1F450F391BBE5CAD7B05605DE9AB7F4D3833151717BDA0`).
 The v0.1.0 tag, built without `-KeygroupPoc`, gives `.bin`
 `E5463E328811C577D5AFA94DBB5B26B88381A386281FD81B4C7BEF17A4E925B6`.
 
@@ -149,7 +184,7 @@ Novation Components.
 |---|---|
 | `patches\stereo-capture-arm-payload.rs` | Rust (no_std) payload appended to the image, holding all ARM-side features |
 | `patches\stereo-capture-arm-payload.ld` | Payload linker script |
-| `patches\*.s` | DSP56300 patch sources (dual-mono capture extension, hook stubs, canaries) |
+| `patches\*.s` | DSP56300 patch sources (dual-mono capture extension, grain engine, looper declick, hook stubs, canaries) |
 | `tools\build_stereo_firmware.ps1` | Top-level build |
 | `tools\build_stereo_firmware.py` | Applies hooks and patches to the stock image, after verifying each precondition |
 | `tools\build_thumb_payload.ps1` | Compiles and links the payload |

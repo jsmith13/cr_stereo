@@ -1,12 +1,42 @@
 # LAST KNOWN GOOD
 
-Build: build\series-b (released as v0.2.0)
+Build: build\grain-c (released as v0.3.0)
 Image: circuitrhythm-firmware-5706-stereo-poc.bin
-Size:  391436 bytes
-SHA-256: 8f0a427e17a7f274e8e07ed1ba1f78c5a367bc99cc03d2d97557a51542b53217
-Pinned: 2026-10-18 (hardware-confirmed by user)
+Size:  399460 bytes
+SHA-256: 255f3566c8c1eae3f249bf5c38487bac5cdb8b7a37b03b9480df4e6bc6b99df2
+Pinned: 2026-11-08 (hardware-confirmed by user)
 
-Build command for this pin (the v0.1.0 command plus -KeygroupPoc):
+Build command for this pin (the v0.2.0 command plus -GranularLooper):
+  pwsh tools\build_stereo_firmware.ps1 -OutputDirectory build\grain-c `
+    -NativeDualCapturePoc -SafePairGuard -SamplePairLedPoc -SamplePairIdentityPoc `
+    -SamplePairGesturePoc -SamplePairWriterCouplingPoc -SampleCacheRefreshPoc `
+    -PairedPlaybackPoc -StereoPositionPoc -StereoStockSaveQueue -CropMirrorWindow `
+    -KeygroupPoc -GranularLooper
+
+Confirmed working on hardware (new since series-b; details in
+reverse-engineering-log.md, builds looper-a..f and grain-a..c):
+  * Micro-looper view (Shift + track): position, size, One Shot / Gated /
+    Loop / Reverse, rate bar; encoders tune, start, length, rate. Stock
+    note-ons/offs and parameter flushes for a looping track are replaced, so
+    the project is never changed.
+  * Declick (patches/looper-declick-dsp.s): 5.3 ms sample fade at note start
+    and loop seams, and a ~7 ms fade-out before a retrigger, for p31-flagged
+    voices only.
+  * Grain engine (patches/granular-engine-dsp.s) on core B, running from
+    shared memory: up to 32 grains, interpolated, windowed, with spray, pitch
+    scatter (octaves / octaves + fifths) and three window shapes.
+  * Mode cycle Off -> Preview -> Armed. Previews end when the view moves
+    away; armed loops follow the transport and are re-pitched by notes;
+    armed grains play while a sequencer, key or MIDI note is held, at its
+    pitch and velocity.
+  * Up/Down select the grain/looper page, with the arrow LEDs lit as stock.
+  * The 399,460-byte image is the new largest the bootloader has accepted.
+
+Previous pin: build\series-b (391436 B, SHA-256
+8f0a427e17a7f274e8e07ed1ba1f78c5a367bc99cc03d2d97557a51542b53217; v0.2.0).
+
+
+Build command for series-b (the v0.1.0 command plus -KeygroupPoc):
   pwsh tools\build_stereo_firmware.ps1 -OutputDirectory build\series-b `
     -NativeDualCapturePoc -SafePairGuard -SamplePairLedPoc -SamplePairIdentityPoc `
     -SamplePairGesturePoc -SamplePairWriterCouplingPoc -SampleCacheRefreshPoc `
