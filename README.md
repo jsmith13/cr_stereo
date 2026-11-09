@@ -31,7 +31,8 @@ risk. The official firmware can always be reinstalled through the bootloader.
 - Default track volume is 70%.
 
 Stereo halves on an unpaired track play as ordinary mono samples.
-`LAST-KNOWN-GOOD.md` has hardware-confirmed details of every feature.
+`LAST-KNOWN-GOOD.md` has hardware-confirmed details of every feature. The
+full guide is in [`docs/stereo-sampling.md`](docs/stereo-sampling.md).
 
 ### Key groups and auto-sampling (new in v0.2.0)
 
@@ -98,6 +99,9 @@ sample settings are not changed.
   sequencer, keys or MIDI: they sound while a note is held, at its pitch and
   velocity.
 - Short fades at loop starts, loop seams and retriggers remove clicks.
+
+The full guide, with pad maps, colours and tips, is in
+[`docs/looper-grains.md`](docs/looper-grains.md).
 
 ## Requirements (Windows)
 
@@ -193,6 +197,8 @@ Novation Components.
 | `tools\firmware_sender.html`, `tools\firmware_sender_core.mjs` | Web MIDI bootloader sender |
 | `tools\disassemble_thumb.py` | Thumb disassembler for checking builds |
 | `LAST-KNOWN-GOOD.md` | Hardware-confirmed build history |
+| `docs\stereo-sampling.md` | User guide for stereo recording and track pairing |
+| `docs\looper-grains.md` | User guide for the micro-looper and grain pages |
 
 The patch tables refer to stock code only by address. Each patch first checks
 the stock bytes it will change: short ones are compared literally, and longer

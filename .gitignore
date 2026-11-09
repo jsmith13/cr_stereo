@@ -10,6 +10,8 @@
 !/README.md
 !/LAST-KNOWN-GOOD.md
 !/requirements.txt
+!/docs/
+!/docs/*.md
 
 !/patches/*.rs
 !/patches/*.ld
